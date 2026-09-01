@@ -1,0 +1,1603 @@
+#!/usr/bin/env bash
+# mem — filesystem + git agent memory CLI with TOON output
+#
+# Storage: markdown files with YAML frontmatter at $MEM_DIR/objects/<type>/<id>.md
+# Sync: git pull/push to bare repo at $MEM_REMOTE (configurable, defaults to OCI bare)
+# Search: ripgrep in v1 (literal + regex). v2 plan documented in §v2-strategy below.
+#
+# AXI compliance: TOON output, 3-4 default fields, truncation with --full, definitive empty
+# states, structured errors on stdout, exit 0/1/2, no interactive prompts, --help on every
+# subcommand.
+#
+# Lifecycle: add → update/merge (versioned, conventional git commits) → dedup (OS-side
+# Jaccard, dry-run default). Search/list rank by priority (desc) then recency — importance
+# over match order, so agents can cap injection by taking the top of the list.
+#
+# §v2-strategy (semantic search)
+#   Why defer: at <5000 memories, `rg` returns <50 hits per query — agent can read all of
+#   them, surfacing literal matches is cheaper than opaque cosine-sim. Vector search pays
+#   off when you can't eyeball the top-50. Codemem's mistake was baking vectors in v1.
+#   When to enable v2: search returns >50 hits where the right one isn't visible.
+#   How (v2): sqlite-vec as a BUILD ARTIFACT in $MEM_DIR/.cache/index.sqlite, not source
+#   of truth. ONNX runtime + Xenova/bge-small-en-v1.5 model (~80MB). Embed on write;
+#   index rebuilds offline. NEVER use a hosted vector DB — adds external dep + latency.
+#   Skip qmd: it runs a daemon. Vector tooling belongs in-process only.
+#   v2 surface: `mem search <q> --features=vector` → DO NOT change default behavior.
+
+set -euo pipefail
+
+# --- Configuration -----------------------------------------------------------
+MEM_DIR="${MEM_DIR:-$HOME/memories}"
+MEM_REMOTE="${MEM_REMOTE:-origin}"
+MEM_OBJECTS="$MEM_DIR/objects"
+TRUNCATE_BYTES=500  # body preview limit; --full bypasses
+
+# Memory types are first-class — driving the id namespace and the subfolder layout.
+declare -A TYPE_PREFIX=(
+  [constraint]=c  [decision]=d  [failure]=f  [howto]=h  [preference]=p
+)
+declare -A TYPE_DIR=(
+  [constraint]=constraints  [decision]=decisions  [failure]=failures
+  [howto]=howtos  [preference]=preferences
+)
+ORDERED_TYPES=(constraint decision failure howto preference)
+
+# --- Helpers -----------------------------------------------------------------
+die() {
+  # Emit a structured TOON error and exit. $1=message, $2=exit_code, optional $3=help.
+  local msg="$1" code="${2:-1}" help="${3:-}"
+  printf 'error: %s\n' "$msg"
+  [[ -n "$help" ]] && printf 'help: %s\n' "$help"
+  exit "$code"
+}
+
+# Parse a single frontmatter field from a markdown memory file.
+#   get_frontmatter <file> <field>  -> echoes value (empty if missing)
+get_frontmatter() {
+  local file="$1" field="$2"
+  # frontmatter is between the first two lines that are exactly "---"
+  awk -v field="$field" '
+    /^---$/ { state++; next }
+    state==1 && $0 ~ "^"field":" {
+      sub("^"field":[[:space:]]*", "")
+      gsub(/^["'"'"']|["'"'"']$/, "")
+      print
+      exit
+    }
+  ' "$file"
+}
+
+# Parse a list-style field (e.g., tags: [auth, jwt, bug] OR tags: ["auth", "jwt"]).
+# Echoes comma-joined values, unquoted.
+get_frontmatter_list() {
+  local file="$1" field="$2"
+  awk -v field="$field" '
+    /^---$/ { state++; next }
+    state==1 && $0 ~ "^"field":" {
+      line=$0
+      sub("^"field":[[:space:]]*", "", line)
+      gsub(/^\[|\]$/, "", line)     # strip outer [ ]
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      # strip quoting around each — handles both unquoted (a, b) and quoted ("a", "b")
+      gsub(/"/, "", line)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      # collapse ", , " → ","
+      gsub(/[[:space:]]*,[[:space:]]*/, ",", line)
+      gsub(/,+/i, ",", line)
+      sub(/^,/, "", line)
+      sub(/,$/, "", line)
+      print line
+      exit
+    }
+  ' "$file"
+}
+
+# Build a YAML tags line from "tag1,tag2" or "tag1 tag2" input (shared by add/update/merge).
+yaml_tags() {
+  local tags="$1" tags_clean tags_yaml="[]" _t
+  tags_clean="${tags// /,}"
+  tags_clean="${tags_clean//,,/,}"
+  tags_clean="${tags_clean#,}"
+  tags_clean="${tags_clean%,}"
+  if [[ -n "$tags_clean" ]]; then
+    IFS=',' read -ra _tags_arr <<< "$tags_clean"
+    local _quoted=()
+    for _t in "${_tags_arr[@]}"; do
+      _t="${_t//./}"           # strip errant leading dots
+      _t="${_t## }"; _t="${_t% }"
+      [[ -n "$_t" ]] && _quoted+=("$(printf '"%s"' "${_t//\"/\\\"}")")
+    done
+    [[ ${#_quoted[@]} -gt 0 ]] && tags_yaml="[$(IFS=, ; printf '%s' "${_quoted[*]}")]"
+  fi
+  printf '%s' "$tags_yaml"
+}
+
+# Jaccard similarity of two normalized-token files (one distinct token per line, sorted).
+jaccard() {
+  local f1="$1" f2="$2"
+  local n1 n2 ni
+  n1=$(wc -l < "$f1" 2>/dev/null); n2=$(wc -l < "$f2" 2>/dev/null)
+  if (( n1 == 0 && n2 == 0 )); then printf '1'; return; fi
+  if (( n1 == 0 || n2 == 0 )); then printf '0'; return; fi
+  ni=$(comm -12 "$f1" "$f2" | wc -l)
+  awk -v i="$ni" -v u="$(( n1 + n2 - ni ))" 'BEGIN{ if (u<=0) print "0"; else printf "%.4f", i/u }'
+}
+
+# Numeric test: s >= t (float-safe via awk; no bc dependency).
+jaccard_ge() { awk -v s="$1" -v t="$2" 'BEGIN{ exit !(s+0 >= t+0) }'; }
+
+# Freshness epoch for ranking: verified > updated > created > mtime.
+# Best-effort date parse; falls back to file mtime on unparseable dates.
+freshness_of() {
+  local f="$1" d m
+  d=$(get_frontmatter "$f" verified)
+  [[ -z "$d" ]] && d=$(get_frontmatter "$f" updated)
+  [[ -z "$d" ]] && d=$(get_frontmatter "$f" created)
+  if [[ -n "$d" ]]; then
+    m=$(date -d "$d" +%s 2>/dev/null || echo 0)
+    [[ "$m" =~ ^[0-9]+$ ]] && { printf '%s' "$m"; return; }
+  fi
+  stat -c '%Y' "$f" 2>/dev/null || echo 0
+}
+
+# Security gate: obvious credential material must never land in git-backed
+# memory without an explicit --force. Returns 0 (safe) / 1 (blocked).
+SECRET_RE='sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[baprs]-[A-Za-z0-9-]{10,}|(password|passwd|secret|api[_-]?key|client[_-]?secret|access[_-]?token)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9_./+-]{8,}'
+secret_hit() {
+  local content="$1"
+  [[ "$content" =~ $SECRET_RE ]]
+}
+
+# Escape a string for TOON (commas are delimiters, so escape any embedded commas)
+toon_escape() {
+  local s="$1"
+  # Replace literal commas with \, — TOON spec uses backslash escape
+  s="${s//,/\\,}"
+  # Replace newlines with spaces (TOON rows are single-line)
+  s="${s//$'\n'/ }"
+  # Trim trailing whitespace
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Build a memory file path from type + id.
+path_for() {
+  local type="$1" id="$2"
+  local dir="${TYPE_DIR[$type]:-}"
+  [[ -z "$dir" ]] && die "unknown type: $type" 2 "valid: ${ORDERED_TYPES[*]}"
+  printf '%s/%s/%s.md' "$MEM_OBJECTS" "$dir" "$id"
+}
+
+# Resolve an id to a file path. Ids are unique across all types (per TYPE_PREFIX).
+resolve_id() {
+  local id="$1"
+  # If user gave a prefix-less slug (e.g. "use-pnpm" without "c-"), try all type prefixes.
+  if [[ -z "$id" ]] ; then return 1; fi
+  for t in "${ORDERED_TYPES[@]}"; do
+    local p="${TYPE_PREFIX[$t]}"
+    # direct match (id starts with prefix-)
+    if [[ "$id" == ${p}-* ]]; then
+      local f="$(path_for "$t" "$id")"
+      [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+    fi
+    # suffix match (id is just the slug)
+    local f="$(path_for "$t" "${p}-${id}")"
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+ensure_repo() {
+  [[ -d "$MEM_DIR/.git" ]] || die "mem store not initialized at $MEM_DIR" 1 "run: mem init"
+  [[ -d "$MEM_OBJECTS" ]] || die "objects/ missing at $MEM_OBJECTS" 1
+}
+
+# TOON list row printer. Reads stdin lines: id|type|title|confidence
+print_toon_list() {
+  local header="$1"  # e.g. results{rownyield}
+  local -a rows=()
+  while IFS='|' read -r id type title conf; do
+    rows+=("$(printf '%s,%s,%s,%s' \
+      "$(toon_escape "$id")" \
+      "$(toon_escape "$type")" \
+      "$(toon_escape "$title")" \
+      "$(toon_escape "$conf")")")
+  done
+  local total=${#rows[@]}
+  if (( total == 0 )); then
+    printf 'mem[0]{id,type,title,confidence}:\n'
+    return
+  fi
+  printf 'mem[%d]{id,type,title,confidence}:\n' "$total"
+  for r in "${rows[@]}"; do printf '  %s\n' "$r"; done
+}
+
+# --- Commands ----------------------------------------------------------------
+
+cmd_home() {
+  ensure_repo
+  # §8: content first — show last 5 memories + counts
+  local total
+  total=$(find "$MEM_OBJECTS" -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+
+  printf 'bin: %s\n' "$0"
+  printf 'description: filesystem + git agent memory (TOON)\n'
+  printf 'store: %s\n' "$MEM_DIR"
+  printf 'remote: %s\n' "$MEM_REMOTE"
+  printf 'counts[%d]{type,count}:\n' "${#ORDERED_TYPES[@]}"
+  for t in "${ORDERED_TYPES[@]}"; do
+    local dir="${TYPE_DIR[$t]}"
+    local n
+    n=$(find "$MEM_OBJECTS/$dir" -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+    printf '  %s,%d\n' "$t" "$n"
+  done
+  printf 'total: %d memories\n' "$total"
+
+  # Recent up to 5 (by file mtime)
+  if (( total > 0 )); then
+    local render_n=$(( total < 5 ? total : 5 ))
+    printf 'recent[%d]{id,type,title,confidence}:\n' "$render_n"
+    find "$MEM_OBJECTS" -name '*.md' -type f -printf '%T@ %p\n' 2>/dev/null \
+      | sort -rn | head -5 | while read -r _ f; do
+        local id type title conf
+        id=$(get_frontmatter "$f" id)
+        type=$(get_frontmatter "$f" type)
+        title=$(get_frontmatter "$f" title)
+        conf=$(get_frontmatter "$f" confidence)
+        printf '  %s,%s,%s,%s\n' \
+          "$(toon_escape "$id")" \
+          "$(toon_escape "$type")" \
+          "$(toon_escape "$title")" \
+          "$(toon_escape "$conf")"
+      done
+  fi
+
+  printf 'help[3]:\n'
+  printf '  Run `mem search "<query>"` to find by keyword\n'
+  printf '  Run `mem add --type <type> --title "<title>"` to add a memory\n'
+  printf '  Run `mem sync` to pull+push from the remote\n'
+}
+
+cmd_init() {
+  [[ $# -gt 0 && ( "$1" == "--help" || "$1" == "-h" ) ]] && { cmd_init_help; return 0; }
+  # Always idempotent — §6
+  mkdir -p "$MEM_OBJECTS"
+  for t in "${ORDERED_TYPES[@]}"; do
+    mkdir -p "$MEM_OBJECTS/${TYPE_DIR[$t]}"
+  done
+  if [[ ! -d "$MEM_DIR/.git" ]]; then
+    # -C is a global option — must precede the subcommand. `git init -C <dir>`
+    # is invalid and silently failed, leaving a store with no repo.
+    git -C "$MEM_DIR" init >/dev/null 2>&1
+    git -C "$MEM_DIR" config user.name "mem-anchor"
+    git -C "$MEM_DIR" config user.email "masculinecache@users.noreply.github.com"
+    printf 'mem: initialized at %s\n' "$MEM_DIR"
+  else
+    printf 'mem: already initialized at %s (no-op)\n' "$MEM_DIR"
+  fi
+  if [[ ! -f "$MEM_DIR/.gitignore" ]]; then
+    printf '.cache/\n' > "$MEM_DIR/.gitignore"
+  fi
+  printf 'help[1]:\n  Run `mem add --type constraint --title "Use pnpm"` to add your first memory\n'
+}
+
+cmd_search() {
+  ensure_repo
+  [[ $# -eq 0 ]] && die "search requires a query" 2 "valid: \`mem search <query>\` [--type <t>] [--limit <n>]"
+  local query="" type="" limit=50 min_prio="" inject=0
+  while (($#)); do
+    case "$1" in
+      --type)  type="$2"; shift 2 ;;
+      --limit|--top) limit="$2"; shift 2 ;;
+      --min-priority) min_prio="$2"; shift 2 ;;
+      --inject) inject=1; shift ;;
+      --help|-h) cmd_search_help; return 0 ;;
+      --*) die "unknown flag $1 for search" 2 "valid: --type, --limit|--top, --min-priority, --inject" ;;
+      *) query="$query $1"; shift ;;
+    esac
+  done
+  query="${query# }"
+  [[ -z "$query" ]] && die "search requires a query" 2
+  if [[ -n "$min_prio" ]] && ! [[ "$min_prio" =~ ^[0-9]+$ ]] || (( min_prio > 100 )); then
+    die "--min-priority must be an integer 0-100" 2
+  fi
+
+  local search_root="$MEM_OBJECTS"
+  [[ -n "$type" ]] && {
+    local d="${TYPE_DIR[$type]:-}"
+    [[ -z "$d" ]] && die "unknown type: $type" 2 "valid: ${ORDERED_TYPES[*]}"
+    search_root="$MEM_OBJECTS/$d"
+  }
+
+  # §v2-strategy: see file header. v1 uses rg literally.
+  local rg_out
+  rg_out=$(rg -l --no-heading -i --max-count 1 \
+    -g '*.md' \
+    "$query" "$search_root" 2>/dev/null || true)
+  local -a files=()
+  if [[ -n "$rg_out" ]]; then
+    while IFS= read -r f; do
+      files+=("$f")
+    done <<< "$rg_out"
+  fi
+  local total=${#files[@]}
+
+  # Track search stats
+  local stats_file="$MEM_DIR/.stats"
+  mkdir -p "$(dirname "$stats_file")"
+  printf '%d\tsearch\t%d\t%s\n' "$(date -u +%s)" "$total" "$query" >> "$stats_file"
+
+  if (( total == 0 )); then
+    # §5: definitive empty state — say zero with context
+    printf 'mem[0]{id,type,title,confidence}:\n'
+    printf 'count: 0 of 0 total\n'
+    printf 'help[1]:\n  Run `mem add --type <type> --title "%s"` if this should be remembered\n' "$query"
+    return 0
+  fi
+
+  # §priority: rank by priority (desc), then freshness (verified/updated/created),
+  # then mtime — importance × freshness (harness-memory style budget cap:
+  # --min-priority is the relevance floor, --limit/--top is the injection cap).
+  # Memories without a priority field default to 50.
+  local -a ranked=()
+  for f in "${files[@]}"; do
+    local pr fr mt
+    pr=$(get_frontmatter "$f" priority); pr="${pr:-50}"
+    if [[ -n "$min_prio" ]] && (( pr < min_prio )); then continue; fi
+    fr=$(freshness_of "$f")
+    mt=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
+    ranked+=("$pr|$fr|$mt|$f")
+  done
+
+  # Budget-cap semantics: total = matches above the priority floor (not raw rg
+  # hits). Guard the empty case BEFORE printf — an empty array emits a phantom
+  # blank line through printf '%s\n' (same pitfall as cmd_dedup).
+  local raw_total=$total
+  total=${#ranked[@]}
+  if (( total == 0 )); then
+    printf 'mem[0]{id,type,title,confidence}:\n'
+    if [[ -n "$min_prio" ]]; then
+      printf 'count: 0 of %d raw matches (none above --min-priority %s)\n' "$raw_total" "$min_prio"
+    else
+      printf 'count: 0 of 0 total\n'
+    fi
+    printf 'help[1]:\n  Run `mem add --type <type> --title "%s"` if this should be remembered\n' "$query"
+    return 0
+  fi
+
+  local shown=$(( total < limit ? total : limit ))
+
+  # --inject mode: compact one-line-per-result format for plugin auto-recall.
+  # Each line: <id> <type> <title> — <abstract> (abstract truncated to 120 chars)
+  # No TOON header, no help blocks — designed for direct injection into context.
+  if (( inject == 1 )); then
+    local i=0 line f
+    while IFS= read -r line; do
+      (( i++ >= limit )) && break
+      f="${line#*|*|*|}"
+      local id type_t title abstract
+      id=$(get_frontmatter "$f" id)
+      type_t=$(get_frontmatter "$f" type)
+      title=$(get_frontmatter "$f" title)
+      abstract=$(get_frontmatter "$f" abstract)
+      # Fallback: if no abstract, use first 120 chars of body
+      # Character-safe: awk prints full body, bash ${abstract:0:120} truncates
+      # by character (not byte), avoiding UTF-8 splitting.
+      if [[ -z "$abstract" ]]; then
+        abstract=$(awk 'BEGIN{s=0} /^---$/{s++;next} s>=2{print}' "$f" | head -1)
+        abstract="${abstract//$'\n'/ }"
+      fi
+      # Truncate abstract to 120 characters (bash 4.2+ substring is char-safe)
+      abstract="${abstract:0:120}"
+      printf '%s %s %s — %s\n' "$id" "$type_t" "$title" "$abstract"
+    done < <(printf '%s\n' "${ranked[@]}" | sort -t'|' -k1,1rn -k2,2rn -k3,3rn)
+    return 0
+  fi
+
+  printf 'mem[%d]{id,type,title,confidence}:\n' "$shown"
+  local i=0 line f
+  while IFS= read -r line; do
+    (( i++ >= limit )) && break
+    f="${line#*|*|*|}"
+    local id type_t title conf
+    id=$(get_frontmatter "$f" id)
+    type_t=$(get_frontmatter "$f" type)
+    title=$(get_frontmatter "$f" title)
+    conf=$(get_frontmatter "$f" confidence)
+    printf '  %s,%s,%s,%s\n' \
+      "$(toon_escape "$id")" \
+      "$(toon_escape "$type_t")" \
+      "$(toon_escape "$title")" \
+      "$(toon_escape "$conf")"
+  done < <(printf '%s\n' "${ranked[@]}" | sort -t'|' -k1,1rn -k2,2rn -k3,3rn)
+  printf 'count: %d of %d total\n' "$shown" "$total"
+  (( total > limit )) && printf 'help[1]:\n  Run `mem search "%s" --limit %d` for more\n' "$query" "$total"
+  printf 'help[1]:\n  Run `mem show <id>` for full body\n'
+}
+
+cmd_show() {
+  ensure_repo
+  [[ $# -lt 1 ]] && die "show requires an <id>" 2 "valid: \`mem show <id>\` [--full]"
+  local id="" full=0
+  while (($#)); do
+    case "$1" in
+      --full) full=1; shift ;;
+      --help|-h) cmd_show_help; return 0 ;;
+      --*) die "unknown flag $1 for show" 2 "valid: --full" ;;
+      *) id="$1"; shift ;;
+    esac
+  done
+  [[ -z "$id" ]] && die "show requires an <id>" 2
+
+  local f
+  f=$(resolve_id "$id") || die "no memory with id \`$id\`" 1
+
+  local title type scope status conf created tags body priority version
+  title=$(get_frontmatter "$f" title)
+  type=$(get_frontmatter "$f" type)
+  scope=$(get_frontmatter "$f" scope)
+  status=$(get_frontmatter "$f" status)
+  conf=$(get_frontmatter "$f" confidence)
+  created=$(get_frontmatter "$f" created)
+  tags=$(get_frontmatter_list "$f" tags)
+  priority=$(get_frontmatter "$f" priority); priority="${priority:-50}"
+  version=$(get_frontmatter "$f" version); version="${version:-1}"
+
+  # Body is everything after the closing --- line
+  body=$(awk '
+    BEGIN { state=0 }
+    /^---$/ { state++; next }
+    state >= 2 { print }
+  ' "$f" | sed -e 's/^[[:space:]]*$//' )
+  body="${body#"${body%%[![:space:]]*}"}"  # ltrim
+  body="${body%"${body##*[![:space:]]}"}"  # rtrim
+
+  local truncated=0
+  local body_out="$body"
+  if (( full == 0 )); then
+    local body_len=${#body}
+    if (( body_len > TRUNCATE_BYTES )); then
+      body_out="${body:0:$TRUNCATE_BYTES}..."
+      truncated=1
+      total_chars_meta=" ($body_len bytes total)"
+    fi
+  fi
+
+  printf 'memory:\n'
+  printf '  id: %s\n' "$id"
+  printf '  type: %s\n' "$type"
+  printf '  title: %s\n' "$title"
+  printf '  status: %s\n' "$status"
+  printf '  scope: %s\n' "$scope"
+  printf '  priority: %s\n' "$priority"
+  printf '  confidence: %s\n' "$conf"
+  printf '  version: %s\n' "$version"
+  printf '  created: %s\n' "$created"
+  [[ -n "$tags" ]] && printf '  tags: %s\n' "$tags"
+  local abstract
+  abstract=$(get_frontmatter "$f" abstract)
+  [[ -n "$abstract" ]] && printf '  abstract: %s\n' "$abstract"
+  printf '  body: %s\n' "${body_out//$'\n'/\\n}"
+  if (( truncated == 1 )); then
+    printf '  truncated: %d bytes shown of %d total\n' "$TRUNCATE_BYTES" "${#body}"
+    printf 'help[1]:\n  Run `mem show %s --full` for complete body\n' "$id"
+  fi
+}
+
+cmd_add() {
+  ensure_repo
+  local type="" title="" body="" scope="" tags="" confidence="0.5" priority="50" verified="" force=0 abstract=""
+  while (($#)); do
+    case "$1" in
+      --type)        type="$2"; shift 2 ;;
+      --title)       title="$2"; shift 2 ;;
+      --body)        body="$2"; shift 2 ;;
+      --abstract)    abstract="$2"; shift 2 ;;
+      --scope)       scope="$2"; shift 2 ;;
+      --tags)        tags="$2"; shift 2 ;;
+      --confidence)  confidence="$2"; shift 2 ;;
+      --priority)    priority="$2"; shift 2 ;;
+      --verified)    verified="$2"; shift 2 ;;
+      --force)       force=1; shift ;;
+      --help|-h)     cmd_add_help; return 0 ;;
+      --*)           die "unknown flag $1 for add" 2 "valid: --type, --title, --body, --abstract, --scope, --tags, --confidence, --priority, --verified, --force" ;;
+      *)             die "add takes only flags, got positional: $1" 2 "valid: --type, --title, --body, --abstract, --scope, --tags, --confidence, --priority, --verified, --force" ;;
+    esac
+  done
+
+  [[ -z "$type" ]]  && die "--type is required" 2 "valid: ${ORDERED_TYPES[*]}"
+  [[ -z "$title" ]] && die "--title is required" 2
+  local t="${TYPE_PREFIX[$type]:-}"
+  [[ -z "$t" ]] && die "unknown type: $type" 2 "valid: ${ORDERED_TYPES[*]}"
+  if ! [[ "$priority" =~ ^[0-9]+$ ]] || (( priority < 0 || priority > 100 )); then
+    die "--priority must be an integer 0-100 (default 50)" 2
+  fi
+
+  # Security gate — credential material must never land in git-backed memory
+  # without an explicit --force (harness-memory pattern, §security gate).
+  if (( force != 1 )) && secret_hit "$title $body"; then
+    die "security gate: credential-like value detected in title/body; refusing to store" 2 "store only the LOCATION of a secret, never the value. Run with --force to override"
+  fi
+
+  # Generate id: <type-prefix>-<datestamp>-<slug-from-title>
+  local datestamp=$(date -u +"%Y-%m-%d")
+  local slug
+  slug=$(printf '%s' "$title" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-//; s/-$//; s/--+/-/g' \
+    | cut -c1-40)
+  local id="${t}-${datestamp}-${slug}"
+
+  # Idempotency — §6. If file with same id exists (same title same day), no-op.
+  local fpath
+  fpath=$(path_for "$type" "$id")
+  if [[ -f "$fpath" ]]; then
+    # Track duplicate skip
+    local stats_file="$MEM_DIR/.stats"
+    mkdir -p "$(dirname "$stats_file")"
+    printf '%d\tdupe\t%s\n' "$(date -u +%s)" "$id" >> "$stats_file"
+    printf 'memory:\n  id: %s\n  status: already-exists (no-op)\n' "$id"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$fpath")"
+
+  # Write the markdown file
+  {
+    printf -- '---\n'
+    printf 'id: %s\n' "$id"
+    printf 'type: %s\n' "$type"
+    printf 'title: %s\n' "$title"
+    [[ -n "$scope" ]]   && printf 'scope: %s\n' "$scope"
+    printf 'status: active\n'
+    printf 'priority: %s\n' "$priority"
+    printf 'confidence: %s\n' "$confidence"
+    printf 'version: 1\n'
+    printf 'created: %s\n' "$datestamp"
+    [[ -n "$verified" ]] && printf 'verified: %s\n' "$verified"
+    printf 'tags: %s\n' "$(yaml_tags "$tags")"
+    [[ -n "$abstract" ]] && printf 'abstract: "%s"\n' "$(printf '%s' "$abstract" | sed 's/"/\\"/g')"
+    printf -- '---\n\n'
+    printf '%s\n' "$body"
+  } > "$fpath"
+
+  # Track + commit (single commit per add)
+  git -C "$MEM_DIR" add "$fpath" 2>/dev/null
+  git -C "$MEM_DIR" commit -m "mem($type): $title" >/dev/null 2>&1 || true
+
+  # Track successful add
+  local stats_file="$MEM_DIR/.stats"
+  mkdir -p "$(dirname "$stats_file")"
+  printf '%d\tadd\t%s\n' "$(date -u +%s)" "$id" >> "$stats_file"
+
+  printf 'memory:\n'
+  printf '  id: %s\n' "$id"
+  printf '  type: %s\n' "$type"
+  printf '  title: %s\n' "$title"
+  printf '  priority: %s\n' "$priority"
+  printf '  saved: %s\n' "$fpath"
+  printf 'help[1]:\n  Run `mem sync` to push to the remote\n'
+}
+
+cmd_list() {
+  ensure_repo
+  local type="" tag="" limit=100 min_prio=""
+  while (($#)); do
+    case "$1" in
+      --type)  type="$2"; shift 2 ;;
+      --tag)   tag="$2"; shift 2 ;;
+      --limit) limit="$2"; shift 2 ;;
+      --min-priority) min_prio="$2"; shift 2 ;;
+      --help|-h) cmd_list_help; return 0 ;;
+      --*) die "unknown flag $1 for list" 2 "valid: --type, --tag, --limit, --min-priority" ;;
+      *) die "list takes only flags, got positional: $1" 2 ;;
+    esac
+  done
+  if [[ -n "$min_prio" ]] && ! [[ "$min_prio" =~ ^[0-9]+$ ]] || (( min_prio > 100 )); then
+    die "--min-priority must be an integer 0-100" 2
+  fi
+
+  local search_root="$MEM_OBJECTS"
+  [[ -n "$type" ]] && {
+    local d="${TYPE_DIR[$type]:-}"
+    [[ -z "$d" ]] && die "unknown type: $type" 2 "valid: ${ORDERED_TYPES[*]}"
+    search_root="$MEM_OBJECTS/$d"
+  }
+
+  local -a files=()
+  while IFS= read -r f; do
+    files+=("$f")
+  done < <(find "$search_root" -name '*.md' -type f 2>/dev/null | sort)
+
+  local -a matching=()
+  for f in "${files[@]}"; do
+    if [[ -n "$tag" ]]; then
+      local tags
+      tags=$(get_frontmatter_list "$f" tags)
+      [[ ",$tags," != *",$tag,"* ]] && continue
+    fi
+    matching+=("$f")
+  done
+
+  local total=${#matching[@]}
+  # §priority: rank by priority (desc), then freshness, then mtime — same as search.
+  local -a ranked=()
+  for f in "${matching[@]}"; do
+    local pr fr mt
+    pr=$(get_frontmatter "$f" priority); pr="${pr:-50}"
+    if [[ -n "$min_prio" ]] && (( pr < min_prio )); then continue; fi
+    fr=$(freshness_of "$f")
+    mt=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
+    ranked+=("$pr|$fr|$mt|$f")
+  done
+  # Guard the empty case BEFORE printf — empty array emits a phantom blank line.
+  local raw_total=$total
+  total=${#ranked[@]}
+  if (( total == 0 )); then
+    printf 'mem[0]{id,type,title,confidence}:\n'
+    printf 'count: 0 of %d total\n' "$raw_total"
+    printf 'help[1]:\n  Run `mem add --type <type> --title "<title>"` to add a memory\n'
+    return 0
+  fi
+  printf 'mem[%d]{id,type,title,confidence}:\n' "$(( total < limit ? total : limit ))"
+  local i=0 line f
+  while IFS= read -r line; do
+    (( i++ >= limit )) && break
+    f="${line#*|*|*|}"
+    local id type_t title conf
+    id=$(get_frontmatter "$f" id)
+    type_t=$(get_frontmatter "$f" type)
+    title=$(get_frontmatter "$f" title)
+    conf=$(get_frontmatter "$f" confidence)
+    printf '  %s,%s,%s,%s\n' \
+      "$(toon_escape "$id")" \
+      "$(toon_escape "$type_t")" \
+      "$(toon_escape "$title")" \
+      "$(toon_escape "$conf")"
+  done < <(printf '%s\n' "${ranked[@]}" | sort -t'|' -k1,1rn -k2,2rn -k3,3rn)
+  printf 'count: %d of %d total\n' "$(( total < limit ? total : limit ))" "$total"
+  (( total > 0 )) && printf 'help[1]:\n  Run `mem show <id>` for full body\n'
+}
+
+cmd_review() {
+  ensure_repo
+  local min_conf="0.5"
+  while (($#)); do
+    case "$1" in
+      --min-confidence) min_conf="$2"; shift 2 ;;
+      --help|-h) cmd_review_help; return 0 ;;
+      --*) die "unknown flag $1 for review" 2 "valid: --min-confidence" ;;
+      *) die "review takes only flags, got positional: $1" 2 ;;
+    esac
+  done
+
+  local -a files=() f
+  while IFS= read -r f; do files+=("$f"); done < <(find "$MEM_OBJECTS" -name '*.md' -type f 2>/dev/null)
+
+  # Review inbox (harness-memory pattern): candidates = confidence below floor
+  # OR never verified. Grouped low-token digest for a human/agent pass — the
+  # agent clears items with `mem update <id> --confidence --verified`.
+  local -a cand=()
+  local total=0 id title conf pr vr created type_t vflag
+  for f in "${files[@]}"; do
+    id=$(get_frontmatter "$f" id); [[ -z "$id" ]] && continue
+    title=$(get_frontmatter "$f" title)
+    type_t=$(get_frontmatter "$f" type)
+    conf=$(get_frontmatter "$f" confidence); conf="${conf:-0.5}"
+    pr=$(get_frontmatter "$f" priority); pr="${pr:-50}"
+    vr=$(get_frontmatter "$f" verified)
+    created=$(get_frontmatter "$f" created); created="${created:-?}"
+    total=$(( total + 1 ))
+    # Candidate = confidence below floor OR never verified.
+    if awk -v a="$conf" -v b="$min_conf" 'BEGIN{exit !(a+0 < b+0)}' || [[ -z "$vr" ]]; then
+      vflag="unverified"; [[ -n "$vr" ]] && vflag="verified:${vr}"
+      cand+=("$pr|$id|$type_t|$title|$conf|$vflag|$created")
+    fi
+  done
+
+  local n=${#cand[@]}
+  # Guard the empty case BEFORE printf — empty array emits a phantom blank line.
+  if (( n == 0 )); then
+    printf 'review[0]{id,type,title,confidence,verified,created}:\n'
+    printf 'count: 0 of %d memories need review (confidence < %s or unverified)\n' "$total" "$min_conf"
+    printf 'help[1]:\n  Review inbox clean. Run `mem review --min-confidence 0.8` to raise the bar\n'
+    return 0
+  fi
+  printf 'review[%d]{id,type,title,confidence,verified,created}:\n' "$n"
+  local line
+  while IFS= read -r line; do
+    IFS='|' read -r _ id type_t title conf vflag created <<< "$line"
+    printf '  %s,%s,%s,%s,%s,%s\n' \
+      "$(toon_escape "$id")" "$(toon_escape "$type_t")" "$(toon_escape "$title")" \
+      "$(toon_escape "$conf")" "$(toon_escape "$vflag")" "$(toon_escape "$created")"
+  done < <(printf '%s\n' "${cand[@]}" | sort -t'|' -k1,1rn)
+  printf 'count: %d of %d memories need review (confidence < %s or unverified)\n' "$n" "$total" "$min_conf"
+  (( n > 0 )) && printf 'help[1]:\n  Run `mem update <id> --confidence <0.7+> --verified <date>` to clear\n'
+}
+
+cmd_sync() {
+  [[ $# -gt 0 && ( "$1" == "--help" || "$1" == "-h" ) ]] && { cmd_sync_help; return 0; }
+  ensure_repo
+  local status=0 output
+  local sync_timeout=30
+  printf 'sync:\n'
+  printf '  remote: %s\n' "$MEM_REMOTE"
+
+  # Circuit breaker: 30s timeout per git operation.
+  # SSH keepalive (ServerAliveInterval/ConnectTimeout) lives in ~/.ssh/config.
+  # Without a timeout, a dead remote tunnel freezes the entire session.
+  local branch
+  branch=$(git -C "$MEM_DIR" config init.defaultBranch 2>/dev/null || echo master)
+
+  # Pull first to grab latest from the anchor
+  if output=$(timeout "$sync_timeout" git -C "$MEM_DIR" pull --rebase "$MEM_REMOTE" "$branch" 2>&1); then
+    printf '  pull: ok\n'
+  else
+    local code=$?
+    if [ "$code" -eq 124 ]; then
+      printf '  pull: timeout (%ds) — remote %s unreachable\n' "$sync_timeout" "$MEM_REMOTE"
+    else
+      printf '  pull: %s\n' "$(printf '%s' "$output" | tail -3 | tr '\n' ' ')"
+    fi
+    status=1
+  fi
+
+  # Push our changes (skip if pull failed — push would also hang)
+  if [ "$status" -eq 0 ]; then
+    if output=$(timeout "$sync_timeout" git -C "$MEM_DIR" push "$MEM_REMOTE" HEAD 2>&1); then
+      printf '  push: ok\n'
+    else
+      local code=$?
+      if [ "$code" -eq 124 ]; then
+        printf '  push: timeout (%ds) — remote %s unreachable\n' "$sync_timeout" "$MEM_REMOTE"
+      else
+        printf '  push: %s\n' "$(printf '%s' "$output" | tail -3 | tr '\n' ' ')"
+      fi
+      status=1
+    fi
+  else
+    printf '  push: skipped (pull failed)\n'
+  fi
+
+  # Brief status summary - §4 pre-computed
+  local ahead behind
+  ahead=$(git -C "$MEM_DIR" rev-list --count @{u}..HEAD 2>/dev/null || echo "?")
+  behind=$(git -C "$MEM_DIR" rev-list --count HEAD..@{u} 2>/dev/null || echo "?")
+  printf '  unpushed: %s commits ahead\n' "$ahead"
+  printf '  unpulled: %s commits behind\n' "$behind"
+  return $status
+}
+
+cmd_status() {
+  [[ $# -gt 0 && ( "$1" == "--help" || "$1" == "-h" ) ]] && { cmd_status_help; return 0; }
+  ensure_repo
+  local total=0
+
+  for t in "${ORDERED_TYPES[@]}"; do
+    local n
+    n=$(find "$MEM_OBJECTS/${TYPE_DIR[$t]}" -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+    total=$((total + n))
+  done
+
+  # Git sync state
+  local ahead behind last_commit last_epoch now diff_s last_fmt="never"
+  ahead=$(git -C "$MEM_DIR" rev-list --count @{u}..HEAD 2>/dev/null || echo "?")
+  behind=$(git -C "$MEM_DIR" rev-list --count HEAD..@{u} 2>/dev/null || echo "?")
+  last_epoch=$(git -C "$MEM_DIR" log -1 --format=%ct 2>/dev/null || echo 0)
+  if [[ "$last_epoch" -gt 0 ]]; then
+    now=$(date +%s)
+    diff_s=$(( now - last_epoch ))
+    if (( diff_s < 60 )); then
+      last_fmt="just now"
+    elif (( diff_s < 3600 )); then
+      last_fmt="$(( diff_s / 60 ))m ago"
+    elif (( diff_s < 86400 )); then
+      last_fmt="$(( diff_s / 3600 ))h ago"
+    else
+      last_fmt="$(( diff_s / 86400 ))d ago"
+    fi
+  fi
+
+  # Remote URL + reachability
+  local remote_url remote_ok="unknown"
+  remote_url=$(git -C "$MEM_DIR" remote get-url "$MEM_REMOTE" 2>/dev/null || echo "none")
+  if [[ "$remote_url" != "none" ]]; then
+    # Extract host from SSH URL for a quick reachability check
+    local remote_host
+    remote_host=$(printf '%s' "$remote_url" | sed -E 's#^[a-z]+://##; s#[:/].*##; s#.*@##')
+    if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes "$remote_host" exit 2>/dev/null; then
+      remote_ok="reachable"
+    else
+      remote_ok="unreachable"
+    fi
+  fi
+
+  # Disk usage
+  local disk_size
+  disk_size=$(du -sh "$MEM_DIR" 2>/dev/null | cut -f1)
+
+  printf 'mem:\n'
+  printf '  store: %s\n' "${MEM_DIR/#$HOME/~}"
+  printf '  total: %d memories\n' "$total"
+  printf '  disk: %s\n' "$disk_size"
+  printf '  remote: %s (%s)\n' "$remote_url" "$remote_ok"
+  printf '  ahead: %s, behind: %s\n' "$ahead" "$behind"
+  printf '  last_commit: %s\n' "$last_fmt"
+
+  local hints=()
+  if [[ "$ahead" != "0" && "$ahead" != "?" ]]; then
+    hints+=("Run \`mem sync\` to push $ahead unpushed commits")
+  fi
+  if [[ "$remote_ok" == "unreachable" ]]; then
+    hints+=("Remote is unreachable — check tunnel/VPN or SSH config")
+  fi
+  if [[ "$behind" != "0" && "$behind" != "?" ]]; then
+    hints+=("Run \`mem sync\` to pull $behind unpulled commits")
+  fi
+  if (( ${#hints[@]} > 0 )); then
+    printf 'help[%d]:\n' "${#hints[@]}"
+    for h in "${hints[@]}"; do
+      printf '  %s\n' "$h"
+    done
+  fi
+}
+
+cmd_stats() {
+  [[ $# -gt 0 && ( "$1" == "--help" || "$1" == "-h" ) ]] && { cmd_stats_help; return 0; }
+  ensure_repo
+  local stats_file="$MEM_DIR/.stats"
+
+  # Count memories by type
+  local total=0
+  local -A type_counts=()
+  for t in "${ORDERED_TYPES[@]}"; do
+    local dir="${TYPE_DIR[$t]}"
+    local n
+    n=$(find "$MEM_OBJECTS/$dir" -name '*.md' -type f 2>/dev/null | wc -l | tr -d ' ')
+    type_counts[$t]=$n
+    total=$((total + n))
+  done
+
+  # Parse .stats file for search/add counts
+  local searches=0 hits=0 adds=0 dupes=0
+  local last_search="never" last_add="never"
+  if [[ -f "$stats_file" ]]; then
+    while IFS=$'\t' read -r epoch event detail _rest; do
+      case "$event" in
+        search)
+          searches=$((searches + 1))
+          if [[ "$detail" -gt 0 ]] 2>/dev/null; then
+            hits=$((hits + 1))
+          fi
+          last_search=$(date -u -d "@$epoch" +"%Y-%m-%d %H:%M" 2>/dev/null || echo "$epoch")
+          ;;
+        add)
+          adds=$((adds + 1))
+          last_add=$(date -u -d "@$epoch" +"%Y-%m-%d %H:%M" 2>/dev/null || echo "$epoch")
+          ;;
+        dupe)
+          dupes=$((dupes + 1))
+          ;;
+      esac
+    done < "$stats_file"
+  fi
+
+  # Calculate hit rate
+  local hit_rate="0%"
+  if (( searches > 0 )); then
+    hit_rate=$(( hits * 100 / searches ))"%"
+  fi
+
+  # TOON output
+  printf 'axi-memory stats:\n'
+  printf '  store: %s\n' "$MEM_DIR"
+  printf '  total: %d memories\n' "$total"
+  for t in "${ORDERED_TYPES[@]}"; do
+    printf '    %s: %d\n' "$t" "${type_counts[$t]}"
+  done
+  printf '  searches: %d (hits: %d, rate: %s)\n' "$searches" "$hits" "$hit_rate"
+  printf '  adds: %d (duplicates skipped: %d)\n' "$adds" "$dupes"
+  printf '  last_search: %s\n' "$last_search"
+  printf '  last_add: %s\n' "$last_add"
+}
+
+cmd_update() {
+  ensure_repo
+  [[ $# -lt 1 ]] && die "update requires an <id>" 2 "valid: \`mem update <id>\` [--title] [--body] [--priority] [--tags] [--scope] [--confidence] [--status]"
+  local id="" title="" body="" priority="" tags="" scope="" confidence="" status="" verified="" abstract=""
+  local set_body=0 set_tags=0 set_abstract=0
+  while (($#)); do
+    case "$1" in
+      --title)      title="$2"; shift 2 ;;
+      --body)       body="$2"; set_body=1; shift 2 ;;
+      --abstract)   abstract="$2"; set_abstract=1; shift 2 ;;
+      --priority)   priority="$2"; shift 2 ;;
+      --tags)       tags="$2"; set_tags=1; shift 2 ;;
+      --scope)      scope="$2"; shift 2 ;;
+      --confidence) confidence="$2"; shift 2 ;;
+      --status)     status="$2"; shift 2 ;;
+      --verified)   verified="$2"; shift 2 ;;
+      --help|-h)    cmd_update_help; return 0 ;;
+      --*)          die "unknown flag $1 for update" 2 "valid: --title, --body, --abstract, --priority, --tags, --scope, --confidence, --status, --verified" ;;
+      *)            id="$1"; shift ;;
+    esac
+  done
+  [[ -z "$id" ]] && die "update requires an <id>" 2
+
+  local f
+  f=$(resolve_id "$id") || die "no memory with id \`$id\`" 1
+
+  local cur_id cur_title cur_type cur_scope cur_priority cur_conf cur_status cur_created cur_tags cur_version cur_body cur_abstract
+  cur_id=$(get_frontmatter "$f" id)
+  cur_title=$(get_frontmatter "$f" title)
+  cur_type=$(get_frontmatter "$f" type)
+  cur_scope=$(get_frontmatter "$f" scope)
+  cur_priority=$(get_frontmatter "$f" priority); cur_priority="${cur_priority:-50}"
+  cur_conf=$(get_frontmatter "$f" confidence); cur_conf="${cur_conf:-0.5}"
+  cur_status=$(get_frontmatter "$f" status); cur_status="${cur_status:-active}"
+  cur_created=$(get_frontmatter "$f" created)
+  cur_verified=$(get_frontmatter "$f" verified)
+  cur_abstract=$(get_frontmatter "$f" abstract)
+  cur_tags=$(get_frontmatter_list "$f" tags)
+  cur_version=$(get_frontmatter "$f" version); cur_version="${cur_version:-1}"
+  cur_body=$(awk 'BEGIN{s=0} /^---$/{s++;next} s>=2{print}' "$f")
+  [[ -z "$cur_title" ]] && die "corrupt memory (no title): $f" 1
+
+  local new_title="${title:-$cur_title}"
+  local new_priority="${priority:-$cur_priority}"
+  local new_conf="${confidence:-$cur_conf}"
+  local new_status="${status:-$cur_status}"
+  local new_scope="${scope:-$cur_scope}"
+  local new_tags="$cur_tags"; [[ $set_tags -eq 1 ]] && new_tags="$tags"
+  local new_body="$cur_body"; [[ $set_body -eq 1 ]] && new_body="$body"
+  local new_abstract="$cur_abstract"; [[ $set_abstract -eq 1 ]] && new_abstract="$abstract"
+  local new_verified="$cur_verified"; [[ -n "$verified" ]] && new_verified="$verified"
+
+  if ! [[ "$new_priority" =~ ^[0-9]+$ ]] || (( new_priority < 0 || new_priority > 100 )); then
+    die "--priority must be an integer 0-100" 2
+  fi
+
+  # No-op detection — nothing changed, nothing to commit.
+  local changed=0
+  [[ "$new_title" != "$cur_title" ]] && changed=1
+  [[ "$new_priority" != "$cur_priority" ]] && changed=1
+  [[ "$new_conf" != "$cur_conf" ]] && changed=1
+  [[ "$new_status" != "$cur_status" ]] && changed=1
+  [[ "$new_scope" != "$cur_scope" ]] && changed=1
+  [[ $set_tags -eq 1 && "$new_tags" != "$cur_tags" ]] && changed=1
+  [[ $set_body -eq 1 && "$new_body" != "$cur_body" ]] && changed=1
+  [[ $set_abstract -eq 1 && "$new_abstract" != "$cur_abstract" ]] && changed=1
+  [[ -n "$verified" && "$new_verified" != "$cur_verified" ]] && changed=1
+  if (( changed == 0 )); then
+    printf 'memory:\n  id: %s\n  status: no-change (no-op)\n' "$cur_id"
+    return 0
+  fi
+
+  local new_version=$(( cur_version + 1 ))
+  local datestamp=$(date -u +"%Y-%m-%d")
+
+  {
+    printf -- '---\n'
+    printf 'id: %s\n' "$cur_id"
+    printf 'type: %s\n' "$cur_type"
+    printf 'title: %s\n' "$new_title"
+    [[ -n "$new_scope" ]] && printf 'scope: %s\n' "$new_scope"
+    printf 'status: %s\n' "$new_status"
+    printf 'priority: %s\n' "$new_priority"
+    printf 'confidence: %s\n' "$new_conf"
+    printf 'version: %s\n' "$new_version"
+    printf 'created: %s\n' "$cur_created"
+    printf 'updated: %s\n' "$datestamp"
+    [[ -n "$new_verified" ]] && printf 'verified: %s\n' "$new_verified"
+    printf 'tags: %s\n' "$(yaml_tags "$new_tags")"
+    [[ -n "$new_abstract" ]] && printf 'abstract: "%s"\n' "$(printf '%s' "$new_abstract" | sed 's/"/\\"/g')"
+    printf -- '---\n\n'
+    printf '%s\n' "$new_body"
+  } > "$f"
+
+  git -C "$MEM_DIR" add "$f" 2>/dev/null
+  git -C "$MEM_DIR" commit -m "mem($cur_type): update $new_title" >/dev/null 2>&1 || true
+
+  printf 'memory:\n'
+  printf '  id: %s\n' "$cur_id"
+  printf '  type: %s\n' "$cur_type"
+  printf '  title: %s\n' "$new_title"
+  printf '  version: %s\n' "$new_version"
+  printf '  updated: %s\n' "$datestamp"
+  printf 'help[1]:\n  Run `mem show %s --full` to review\n' "$cur_id"
+}
+
+# Core merge logic — shared by `mem merge` and `mem dedup --apply`.
+#   cmd_merge_impl <keep-id> <absorb-id> <dry> <quiet>
+cmd_merge_impl() {
+  local keep="$1" absorb="$2" dry="$3" quiet="${4:-0}"
+  local fk fa
+  fk=$(resolve_id "$keep") || die "no memory with id \`$keep\`" 1
+  fa=$(resolve_id "$absorb") || die "no memory with id \`$absorb\`" 1
+  [[ "$fk" == "$fa" ]] && die "cannot merge a memory into itself" 2
+
+  local k_id k_type k_title k_scope k_body k_prio k_conf k_status k_created k_tags k_version k_abstract
+  local a_id a_title a_body a_prio a_conf a_tags a_version a_abstract
+  k_id=$(get_frontmatter "$fk" id); k_type=$(get_frontmatter "$fk" type)
+  k_title=$(get_frontmatter "$fk" title); k_scope=$(get_frontmatter "$fk" scope)
+  k_body=$(awk 'BEGIN{s=0} /^---$/{s++;next} s>=2{print}' "$fk")
+  k_prio=$(get_frontmatter "$fk" priority); k_prio="${k_prio:-50}"
+  k_conf=$(get_frontmatter "$fk" confidence); k_conf="${k_conf:-0.5}"
+  k_status=$(get_frontmatter "$fk" status); k_status="${k_status:-active}"
+  k_created=$(get_frontmatter "$fk" created)
+  k_tags=$(get_frontmatter_list "$fk" tags)
+  k_version=$(get_frontmatter "$fk" version); k_version="${k_version:-1}"
+  k_abstract=$(get_frontmatter "$fk" abstract)
+  a_id=$(get_frontmatter "$fa" id); a_title=$(get_frontmatter "$fa" title)
+  a_body=$(awk 'BEGIN{s=0} /^---$/{s++;next} s>=2{print}' "$fa")
+  a_prio=$(get_frontmatter "$fa" priority); a_prio="${a_prio:-50}"
+  a_conf=$(get_frontmatter "$fa" confidence); a_conf="${a_conf:-0.5}"
+  a_tags=$(get_frontmatter_list "$fa" tags)
+  a_version=$(get_frontmatter "$fa" version); a_version="${a_version:-1}"
+  a_abstract=$(get_frontmatter "$fa" abstract)
+
+  local m_body="$k_body"
+  [[ -n "$a_body" ]] && m_body="$k_body"$'\n\n'"--- merged from $a_id ---"$'\n'"$a_body"
+  local m_abstract="$k_abstract"
+  [[ -z "$m_abstract" && -n "$a_abstract" ]] && m_abstract="$a_abstract"
+  local m_prio=$(( k_prio > a_prio ? k_prio : a_prio ))
+  local m_conf
+  m_conf=$(awk -v a="$k_conf" -v b="$a_conf" 'BEGIN{ print (a+0 > b+0) ? a : b }')
+  local m_version=$(( (k_version > a_version ? k_version : a_version) + 1 ))
+  local m_tags="$k_tags"
+  if [[ -n "$a_tags" ]]; then
+    [[ -n "$m_tags" ]] && m_tags="$m_tags,$a_tags" || m_tags="$a_tags"
+    m_tags=$(printf '%s' "$m_tags" | tr ',' '\n' | sort -u | paste -sd, -)
+  fi
+  local datestamp=$(date -u +"%Y-%m-%d")
+
+  if (( dry )); then
+    printf 'merge (dry-run):\n'
+    printf '  keep:   %s (%s)\n' "$k_id" "$k_title"
+    printf '  absorb: %s (%s)\n' "$a_id" "$a_title"
+    printf '  result: version %s, priority %s, tags: %s\n' "$m_version" "$m_prio" "$m_tags"
+    printf 'help[1]:\n  Run \`mem merge %s %s\` to apply\n' "$k_id" "$a_id"
+    return 0
+  fi
+
+  {
+    printf -- '---\n'
+    printf 'id: %s\n' "$k_id"
+    printf 'type: %s\n' "$k_type"
+    printf 'title: %s\n' "$k_title"
+    [[ -n "$k_scope" ]] && printf 'scope: %s\n' "$k_scope"
+    printf 'status: %s\n' "$k_status"
+    printf 'priority: %s\n' "$m_prio"
+    printf 'confidence: %s\n' "$m_conf"
+    printf 'version: %s\n' "$m_version"
+    printf 'created: %s\n' "$k_created"
+    printf 'updated: %s\n' "$datestamp"
+    printf 'tags: %s\n' "$(yaml_tags "$m_tags")"
+    [[ -n "$m_abstract" ]] && printf 'abstract: "%s"\n' "$(printf '%s' "$m_abstract" | sed 's/"/\\"/g')"
+    printf -- '---\n\n'
+    printf '%s\n' "$m_body"
+  } > "$fk"
+
+  git -C "$MEM_DIR" add "$fk" 2>/dev/null
+  git -C "$MEM_DIR" rm -q --ignore-unmatch "$fa" 2>/dev/null
+  git -C "$MEM_DIR" commit -m "mem($k_type): merge $a_id into $k_id" >/dev/null 2>&1 || true
+
+  if (( quiet )); then
+    printf '  merged: %s into %s (v%s)\n' "$a_id" "$k_id" "$m_version"
+  else
+    printf 'memory:\n'
+    printf '  id: %s\n' "$k_id"
+    printf '  title: %s\n' "$k_title"
+    printf '  version: %s\n' "$m_version"
+    printf '  merged: %s (body + tags, max priority/confidence)\n' "$a_id"
+    printf '  absorbed_path: %s\n' "${fa/#$HOME/~}"
+    printf 'help[1]:\n  Absorbed memory is recoverable from git history (\`git log --diff-filter=D\`)\n'
+  fi
+}
+
+cmd_merge() {
+  ensure_repo
+  # Check for --help early, before arg validation
+  for arg in "$@"; do
+    [[ "$arg" == "--help" || "$arg" == "-h" ]] && { cmd_merge_help; return 0; }
+  done
+  [[ $# -lt 2 ]] && die "merge requires <keep-id> and <absorb-id>" 2 "valid: \`mem merge <keep-id> <absorb-id>\` [--dry-run]"
+  local keep="" absorb="" dry=0
+  while (($#)); do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --help|-h) cmd_merge_help; return 0 ;;
+      --*) die "unknown flag $1 for merge" 2 "valid: --dry-run" ;;
+      *) [[ -z "$keep" ]] && keep="$1" || absorb="$1"; shift ;;
+    esac
+  done
+  [[ -z "$keep" || -z "$absorb" ]] && die "merge requires <keep-id> and <absorb-id>" 2
+  cmd_merge_impl "$keep" "$absorb" "$dry" 0
+}
+
+cmd_dedup() {
+  ensure_repo
+  local threshold="0.6" type="" limit=50 apply=0
+  while (($#)); do
+    case "$1" in
+      --threshold) threshold="$2"; shift 2 ;;
+      --type)      type="$2"; shift 2 ;;
+      --limit)     limit="$2"; shift 2 ;;
+      --apply)     apply=1; shift ;;
+      --dry-run)   apply=0; shift ;;
+      --help|-h)   cmd_dedup_help; return 0 ;;
+      --*) die "unknown flag $1 for dedup" 2 "valid: --threshold, --type, --limit, --apply, --dry-run" ;;
+      *) die "dedup takes only flags, got positional: $1" 2 ;;
+    esac
+  done
+  if ! [[ "$threshold" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+    die "--threshold must be a float 0-1 (default 0.6)" 2
+  fi
+
+  local search_root="$MEM_OBJECTS"
+  [[ -n "$type" ]] && {
+    local d="${TYPE_DIR[$type]:-}"
+    [[ -z "$d" ]] && die "unknown type: $type" 2 "valid: ${ORDERED_TYPES[*]}"
+    search_root="$MEM_OBJECTS/$d"
+  }
+
+  # OS-side, zero-LLM dedup: normalized-title token Jaccard within same type,
+  # bucketed by first token to avoid an O(N²) scan. Dry-run by default.
+  local cache="$MEM_DIR/.cache/dedup"
+  rm -rf "$cache"; mkdir -p "$cache"
+
+  local -A id_file=() id_prio=() id_title=() id_type=() id_created=()
+  local -a id_list=()
+  local f i
+  while IFS= read -r f; do
+    i=$(get_frontmatter "$f" id)
+    [[ -z "$i" ]] && continue
+    local t pr cr ti norm
+    t=$(get_frontmatter "$f" type)
+    pr=$(get_frontmatter "$f" priority); pr="${pr:-50}"
+    cr=$(get_frontmatter "$f" created); cr="${cr:-9999}"
+    ti=$(get_frontmatter "$f" title)
+    id_file[$i]="$f"; id_prio[$i]="$pr"; id_title[$i]="$ti"; id_type[$i]="$t"; id_created[$i]="$cr"
+    id_list+=("$i")
+    norm=$(printf '%s' "$ti" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/ /g' | tr -s ' ')
+    printf '%s\n' "$norm" | tr ' ' '\n' | grep -v '^$' | sort -u > "$cache/tokens.$i"
+  done < <(find "$search_root" -name '*.md' -type f 2>/dev/null)
+  local total=${#id_list[@]}
+  if (( total < 2 )); then
+    printf 'dedup[0]{sim,keep,absorb,title}:\n'
+    printf 'count: 0 candidates (need >= 2 memories)\n'
+    rm -rf "$cache"
+    return 0
+  fi
+
+  local -A bucket=()
+  local id ft
+  for id in "${id_list[@]}"; do
+    ft=$(head -1 "$cache/tokens.$id")
+    [[ -z "$ft" ]] && ft="__empty__"
+    bucket["$ft"]="${bucket[$ft]:-} $id"
+  done
+
+  local -a pairs=()
+  local bkey
+  for bkey in "${!bucket[@]}"; do
+    local -a members=(${bucket[$bkey]})
+    (( ${#members[@]} < 2 )) && continue
+    local a b ia ib sim
+    for (( a=0; a<${#members[@]}; a++ )); do
+      for (( b=a+1; b<${#members[@]}; b++ )); do
+        ia="${members[$a]}"; ib="${members[$b]}"
+        [[ "${id_type[$ia]}" != "${id_type[$ib]}" ]] && continue
+        sim=$(jaccard "$cache/tokens.$ia" "$cache/tokens.$ib")
+        if jaccard_ge "$sim" "$threshold"; then
+          local keep absorb
+          if (( id_prio[$ia] > id_prio[$ib] )); then keep="$ia"; absorb="$ib";
+          elif (( id_prio[$ib] > id_prio[$ia] )); then keep="$ib"; absorb="$ia";
+          elif [[ "${id_created[$ia]}" < "${id_created[$ib]}" ]]; then keep="$ia"; absorb="$ib";
+          elif [[ "${id_created[$ib]}" < "${id_created[$ia]}" ]]; then keep="$ib"; absorb="$ia";
+          else
+            if [[ "$ia" < "$ib" ]]; then keep="$ia"; absorb="$ib"; else keep="$ib"; absorb="$ia"; fi
+          fi
+          pairs+=("$sim|$keep|$absorb|${id_title[$keep]} ⇐ ${id_title[$absorb]}")
+        fi
+      done
+    done
+  done
+
+  local n=${#pairs[@]}
+  if (( n == 0 )); then
+    # Guard BEFORE mapfile — printf '%s\n' on an empty array emits one blank
+    # line, which mapfile would turn into a phantom [""] pair (false positive).
+    printf 'dedup[0]{sim,keep,absorb,title}:\n'
+    printf 'count: 0 candidate pairs across %d memories (threshold %s)\n' "$total" "$threshold"
+    printf 'help[1]:\n  No near-duplicate titles. Lower --threshold to surface weaker matches\n'
+    rm -rf "$cache"
+    return 0
+  fi
+
+  local -a sorted
+  mapfile -t sorted < <(printf '%s\n' "${pairs[@]}" | sort -t'|' -k1,1rn)
+
+  printf 'dedup[%d]{sim,keep,absorb,title}:\n' "$(( n < limit ? n : limit ))"
+  local rendered=0 line sim_k keep_a absorb_t ttl
+  for line in "${sorted[@]}"; do
+    (( rendered++ >= limit )) && break
+    IFS='|' read -r sim_k keep_a absorb_t ttl <<< "$line"
+    printf '  %s,%s,%s,%s\n' \
+      "$(toon_escape "$sim_k")" \
+      "$(toon_escape "$keep_a")" \
+      "$(toon_escape "$absorb_t")" \
+      "$(toon_escape "$ttl")"
+  done
+  printf 'count: %d candidate pair(s) across %d memories (threshold %s)\n' "$n" "$total" "$threshold"
+
+  if (( apply )); then
+    local -A absorbed=()
+    local merged_n=0
+    for line in "${sorted[@]}"; do
+      IFS='|' read -r sim_k keep_a absorb_t ttl <<< "$line"
+      [[ -n "${absorbed[$keep_a]:-}" || -n "${absorbed[$absorb_t]:-}" ]] && continue
+      absorbed[$absorb_t]=1
+      cmd_merge_impl "$keep_a" "$absorb_t" 0 1
+      merged_n=$(( merged_n + 1 ))
+    done
+    printf 'merged: %d pair(s) (dry-run was default; absorbed ids recoverable from git)\n' "$merged_n"
+  else
+    printf 'help[1]:\n  Dry-run by default. Run \`mem dedup --apply\` to merge (higher priority kept)\n'
+  fi
+  rm -rf "$cache"
+}
+
+cmd_init_help() {
+  cat <<'EOF'
+mem init — initialize the memory store at $MEM_DIR (idempotent)
+
+Usage: mem init
+
+Creates the directory structure:
+  $MEM_DIR/objects/{constraints,decisions,failures,howtos,preferences}/
+  $MEM_DIR/.git/                  (git repository)
+  $MEM_DIR/.gitignore             (ignores .cache/)
+
+Safe to run multiple times — only creates missing directories/files.
+
+Configuration:
+  MEM_DIR  path to memory store (default: $HOME/memories)
+EOF
+}
+
+# --- Per-subcommand --help blocks (§10) --------------------------------------
+
+cmd_help_top() {
+  cat <<'EOF'
+mem — filesystem + git agent memory with TOON output
+
+Usage: mem [<command>] [<args>]
+
+Commands:
+  (no args)        show recent + status (content-first home view)
+  init             initialize mem store at $MEM_DIR (idempotent)
+  search <query>   ripgrep search across all memories (priority-ranked)
+  show <id>        full detail (body truncated by default; use --full)
+  add              create a new memory
+  update <id>      edit an existing memory (bumps version, git commit)
+  merge <keep> <absorb>  merge two memories (body+tags, max priority/version)
+  dedup            find near-duplicate titles (OS-side Jaccard, no LLM)
+  list             list memories (filter by --type / --tag)
+  review           list memories needing review (low confidence / unverified)
+  status           operational health: sync state, remote, disk
+  sync             git pull --rebase && git push
+  stats            show usage statistics
+  --help           this message
+
+Configuration (env):
+  MEM_DIR          path to memory store (default: $HOME/memories)
+  MEM_REMOTE       git remote name (default: origin)
+
+Storage shape:
+  $MEM_DIR/objects/<type>/<id>.md  (markdown + YAML frontmatter)
+  $MEM_DIR/.git/                   (git repo)
+  $MEM_DIR/.cache/                 (transient, gitignored)
+
+Help per command:
+  mem <command> --help
+EOF
+}
+
+cmd_search_help() {
+  cat <<'EOF'
+mem search — keyword search across memories (v1: ripgrep literal + regex)
+
+Usage: mem search <query> [--type <type>] [--limit <n>] [--top <n>] [--min-priority <p>]
+
+Flags:
+  --type <type>     constrain to one type (constraint|decision|failure|howto|preference)
+  --limit <n>       max rows in output (default: 50). Total count is always shown.
+  --top <n>         alias of --limit (injection budget cap)
+  --min-priority <p> relevance floor: memories with priority < p are excluded
+                    (budget cap pattern — top-N above a cutoff, not just truncated)
+  --inject          compact output: id + abstract only (~40% token savings)
+  --help            this message
+
+Output: TOON list with id, type, title, confidence fields, plus total count.
+Results are ranked by priority (desc), then freshness (verified/updated/created),
+then recency — importance × freshness over match order.
+
+Notes:
+  - v1 uses ripgrep literal/regex matching against the entire markdown file
+    (frontmatter + body). Semantic/vector search is deferred to v2 — see
+    file-header §v2-strategy.
+EOF
+}
+
+cmd_show_help() {
+  cat <<'EOF'
+mem show — full detail for one memory by id
+
+Usage: mem show <id> [--full]
+
+Flags:
+  --full   bypass 500-byte body truncation, show complete body
+  --help   this message
+
+Id resolution:
+  Ids may be passed full ("d-2026-07-19-auth-401") or as suffix ("2026-07-19-auth-401").
+  The CLI tries all 5 type prefixes (constraint, decision, failure, howto, preference)
+  and resolves the first match found on disk.
+
+Output includes: id, type, title, status, scope, priority, confidence, version,
+created, tags, body (truncated at 500 bytes with a --full hint).
+EOF
+}
+
+cmd_add_help() {
+  cat <<'EOF'
+mem add — create a new memory
+
+Usage: mem add --type <type> --title "<title>" [--body "..."] [--scope "..."] [--tags "..."] [--confidence 0.5] [--priority 50] [--verified <date>]
+
+Required:
+  --type <type>        constraint|decision|failure|howto|preference
+  --title "<title>"    short title (used to generate the slug)
+
+Optional:
+  --body "<text>""     long-form markdown body
+  --abstract "<text>"  one-line summary for compact recall
+  --scope "<scope>"    free-text scope tag (project name, etc.)
+  --tags "<csv>"       comma or space separated: "auth, jwt, bug"
+  --confidence <f>     0.0-1.0 (default: 0.5)
+  --priority <n>       0-100 importance rank (default: 50). Search/list sort by
+                       this descending. Suggested: constraint 80, failure 75,
+                       decision 70, howto 60, preference 50.
+  --verified <date>    YYYY-MM-DD confirmation date (feeds freshness ranking)
+  --force              bypass the security gate (never store real secret values)
+
+Security gate:
+  Credential-like material (API keys, tokens, private keys, password= values)
+  is refused with a structured error unless --force is passed. Store the
+  LOCATION of a secret, never the value.
+
+Behavior:
+  - Id is auto-generated: <type-prefix>-<date>-<slug>
+  - File is written to $MEM_DIR/objects/<type>/<id>.md
+  - Committed immediately (one commit per add)
+  - Idempotent: re-adding the same title on the same day is a no-op (exit 0)
+
+Examples:
+  mem add --type constraint --title "Use pnpm" --body "Never run npm install in this repo." --tags "tooling" --priority 80
+  mem add --type failure --title "JWT decode panic" --body "prod crash at 04:32 UTC..." --scope example-api --priority 75
+EOF
+}
+
+cmd_update_help() {
+  cat <<'EOF'
+mem update — edit an existing memory without touching git
+
+Usage: mem update <id> [--title "<t>"] [--body "..."] [--priority <n>] [--tags "<csv>"] [--scope "<s>"] [--confidence <f>] [--status <s>] [--verified <date>]
+
+Flags:
+  --title "<t>"       replace the title (id stays stable — slugs never change)
+  --body "..."        replace the body
+  --abstract "..."    replace the one-line summary
+  --priority <n>      0-100 importance rank
+  --tags "<csv>"      replace the tags
+  --scope "<s>"       replace the scope
+  --confidence <f>    0.0-1.0
+  --status <s>        replace the status (default: active)
+  --verified <date>   set YYYY-MM-DD confirmation date (feeds freshness ranking)
+  --help              this message
+
+Behavior:
+  - Id and type are immutable; title change does NOT re-slug the id.
+  - Bumps `version` (+1) and records `updated: <date>` in frontmatter.
+  - Writes the file + one conventional git commit ("mem(<type>): update ...").
+  - No-op detection: no changed field → no commit, exit 0.
+
+Examples:
+  mem update c-2026-07-19-use-pnpm --priority 90
+  mem update h-2026-08-03-deploy-example-api --body "revised steps" --priority 70
+EOF
+}
+
+cmd_merge_help() {
+  cat <<'EOF'
+mem merge — merge two memories into one (keep-id survives, absorb-id is absorbed)
+
+Usage: mem merge <keep-id> <absorb-id> [--dry-run]
+
+Flags:
+  --dry-run   print the planned merge without writing anything
+  --help      this message
+
+Merge semantics (Tencent-style update/merge):
+  - Keeper keeps its id/type/title/status.
+  - Body: absorbed body appended under a "--- merged from <id> ---" header.
+  - Abstract: keeper's abstract preserved; if keeper has none, absorb's abstract is used.
+  - Tags: union (deduped). Priority: max. Confidence: max.
+  - Version: max(keep, absorb) + 1. `updated: <date>` written.
+  - Absorbed file is removed (git rm) — recoverable from git history
+    (`git log --diff-filter=D`).
+
+Examples:
+  mem merge d-2026-07-19-adopt-mem d-2026-08-03-mem-v2
+  mem merge d-2026-07-19-adopt-mem d-2026-08-03-mem-v2 --dry-run
+EOF
+}
+
+cmd_dedup_help() {
+  cat <<'EOF'
+mem dedup — find near-duplicate memories by title similarity (OS-side, no LLM)
+
+Usage: mem dedup [--threshold <f>] [--type <type>] [--limit <n>] [--apply]
+
+Flags:
+  --threshold <f>   Jaccard similarity 0-1 (default: 0.6). Exact normalized
+                    title equality is always 1.0.
+  --type <type>     constrain to one type
+  --limit <n>       max candidate pairs shown (default: 50)
+  --apply           perform the merges (dry-run is the default — never destructive)
+  --help            this message
+
+Mechanism:
+  - Normalizes titles (lowercase, non-alphanumeric → space), compares token
+    sets by Jaccard within the same type, bucketed by first token to avoid an
+    O(N²) scan. Zero LLM cost — pure shell + awk.
+  - Winner selection: higher priority kept; tie → earlier created; tie → id order.
+
+When to run: at harvest time (after adding winning-path memories) and after
+seeding batches. Cheap enough to run every session end.
+
+Examples:
+  mem dedup                        # dry-run candidates
+  mem dedup --threshold 0.5 --type howto
+  mem dedup --apply                # merge candidates (higher priority kept)
+EOF
+}
+
+cmd_list_help() {
+  cat <<'EOF'
+mem list — list memories
+
+Usage: mem list [--type <type>] [--tag <tag>] [--limit <n>]
+
+Flags:
+  --type <type>   constrain to one type
+  --tag <tag>     filter by tag (substring match)
+  --limit <n>     max rows (default: 100)
+  --help          this message
+
+Output: TOON list with id, type, title, confidence, plus total count.
+
+Examples:
+  mem list --type failure
+  mem list --tag auth --limit 20
+EOF
+}
+
+cmd_review_help() {
+  cat <<'EOF'
+mem review — review inbox: memories needing a human/agent decision
+
+Usage: mem review [--min-confidence <f>]
+
+Flags:
+  --min-confidence <f>  confidence floor (default: 0.5)
+
+Candidates (harness-memory "review inbox" pattern):
+  - confidence < floor, OR
+  - no `verified` date in frontmatter (never explicitly confirmed)
+
+Output: TOON list {id,type,title,confidence,verified,created}, priority-ranked.
+
+Clearing: mem update <id> --confidence <0.7+> --verified <date>
+EOF
+}
+
+cmd_sync_help() {
+  cat <<'EOF'
+mem sync — git pull --rebase && git push to the configured remote
+
+Usage: mem sync
+
+Behavior:
+  - Pulls from the remote (default: origin) with 30s timeout
+  - Pushes local commits if pull succeeded
+  - Reports sync state: unpushed/unpulled commit counts
+
+Remote configuration:
+  MEM_REMOTE  git remote name (default: origin)
+
+Notes:
+  - Uses timeout(1) to prevent hanging on unreachable remotes
+  - Pull uses --rebase to keep history linear
+  - SSH keepalive config lives in ~/.ssh/config
+EOF
+}
+
+cmd_status_help() {
+  cat <<'EOF'
+mem status — operational health check
+
+Usage: mem status
+
+Output: TOON block with store path, memory count, disk usage,
+remote URL + reachability, sync state (ahead/behind), last commit time.
+
+Includes contextual hints when action is needed (unpushed commits,
+unreachable remote, unpulled commits).
+EOF
+}
+
+cmd_stats_help() {
+  cat <<'EOF'
+mem stats — show usage statistics
+
+Usage: mem stats
+
+Output: TOON block with:
+  - store: path to memory store
+  - total: memory count by type
+  - searches: total searches, hits, hit rate
+  - adds: total adds, duplicates skipped
+  - last_search: timestamp of last search
+  - last_add: timestamp of last add
+
+Stats are tracked in $MEM_DIR/.stats (TSV append-only).
+EOF
+}
+
+# --- Top-level dispatcher -----------------------------------------------------
+
+main() {
+  # §8 content-first: `mem` with no args shows the home view (live state, not help).
+  # `mem --help` / `mem help` / `mem -h` shows the top-level help block.
+  if [[ $# -eq 0 ]]; then
+    cmd_home
+    return $?
+  fi
+  local cmd="$1"
+  if [[ "$cmd" == "--help" || "$cmd" == "-h" || "$cmd" == "help" ]]; then
+    cmd_help_top
+    return 0
+  fi
+  shift
+  case "$cmd" in
+    init)   cmd_init   "$@" ;;
+    search) cmd_search "$@" ;;
+    show)   cmd_show   "$@" ;;
+    add)    cmd_add    "$@" ;;
+    update) cmd_update "$@" ;;
+    merge)  cmd_merge  "$@" ;;
+    dedup)  cmd_dedup  "$@" ;;
+    list)   cmd_list   "$@" ;;
+    review) cmd_review "$@" ;;
+    sync)   cmd_sync   "$@" ;;
+    status) cmd_status "$@" ;;
+    stats)  cmd_stats  "$@" ;;
+    *)
+      die "unknown command: $cmd" 2 "run \`mem --help\` for the command list"
+      ;;
+  esac
+}
+
+main "$@"
