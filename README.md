@@ -4,6 +4,30 @@ Filesystem + git agent memory CLI with TOON output. Durable memory that survives
 
 Following the [AXI 10 principles](https://axi.md): TOON output, minimal schemas, content-first home view, truncation with `--full`, definitive empty states, structured errors on stdout, exit 0/1/2.
 
+## Install
+
+Requires bash, git, and ripgrep (`rg`).
+
+```bash
+npm i -g @masculinecache/mem
+mem --version   # 0.1.0
+```
+
+Or without npm — clone the repo and put `mem` on your `PATH`:
+
+```bash
+git clone https://github.com/masculinecache/axi-memory.git
+ln -s "$(pwd)/axi-memory/mem" ~/.local/bin/mem
+```
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [docs/design.md](docs/design.md) | Why filesystem + git + markdown; the memory model; triage; L0 abstracts; ranking/lifecycle; sync model; search strategy |
+| [docs/integration.md](docs/integration.md) | Harness-neutral integration: the shell / tool / hook surfaces, tool mapping, recall and capture patterns |
+| [docs/harnesses.md](docs/harnesses.md) | Survey of hook/lifecycle equivalents across agent harnesses (Claude Code, Codex, pi, Grok, Kimi) |
+
 ## Quick Start
 
 ```bash

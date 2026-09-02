@@ -1,0 +1,40 @@
+{
+  "name": "@masculinecache/mem",
+  "version": "0.1.0",
+  "description": "Filesystem + git agent memory CLI with TOON output — durable, portable memory for coding agents",
+  "bin": {
+    "mem": "mem"
+  },
+  "files": [
+    "mem",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "./tests/run.sh",
+    "pack:check": "npm publish --dry-run"
+  },
+  "keywords": [
+    "agent",
+    "memory",
+    "cli",
+    "axi",
+    "toon",
+    "bash",
+    "git",
+    "llm"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/masculinecache/axi-memory.git"
+  },
+  "homepage": "https://github.com/masculinecache/axi-memory#readme",
+  "bugs": {
+    "url": "https://github.com/masculinecache/axi-memory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

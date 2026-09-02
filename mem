@@ -2,7 +2,7 @@
 # mem — filesystem + git agent memory CLI with TOON output
 #
 # Storage: markdown files with YAML frontmatter at $MEM_DIR/objects/<type>/<id>.md
-# Sync: git pull/push to bare repo at $MEM_REMOTE (configurable, defaults to OCI bare)
+# Sync: git pull/push to the bare repo behind the $MEM_REMOTE git remote (default: origin)
 # Search: ripgrep in v1 (literal + regex). v2 plan documented in §v2-strategy below.
 #
 # AXI compliance: TOON output, 3-4 default fields, truncation with --full, definitive empty
@@ -27,6 +27,7 @@
 set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
+MEM_VERSION="0.1.0"
 MEM_DIR="${MEM_DIR:-$HOME/memories}"
 MEM_REMOTE="${MEM_REMOTE:-origin}"
 MEM_OBJECTS="$MEM_DIR/objects"
@@ -1289,6 +1290,7 @@ Commands:
   sync             git pull --rebase && git push
   stats            show usage statistics
   --help           this message
+  --version        print version and exit
 
 Configuration (env):
   MEM_DIR          path to memory store (default: $HOME/memories)
@@ -1578,6 +1580,10 @@ main() {
   local cmd="$1"
   if [[ "$cmd" == "--help" || "$cmd" == "-h" || "$cmd" == "help" ]]; then
     cmd_help_top
+    return 0
+  fi
+  if [[ "$cmd" == "--version" || "$cmd" == "-V" || "$cmd" == "version" ]]; then
+    printf 'mem %s\n' "$MEM_VERSION"
     return 0
   fi
   shift

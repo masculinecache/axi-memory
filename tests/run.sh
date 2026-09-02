@@ -295,6 +295,21 @@ assert_exit "global --help exit 0" 0 "$RC"
 assert_has "global help has Usage" "$OUT" "Usage"
 
 echo
+echo "== version =="
+
+t "global --version prints version"
+run --version
+assert_exit "--version exit 0" 0 "$RC"
+assert_has "--version output" "$OUT" "mem "
+
+t "-V and version aliases match --version"
+run -V
+V1="$OUT"
+run version
+assert_eq "version alias matches -V" "$V1" "$OUT"
+assert_exit "version alias exit 0" 0 "$RC"
+
+echo
 echo "== stderr/structure: stdout-only on errors (no dependency leak) =="
 new_sandbox
 run add

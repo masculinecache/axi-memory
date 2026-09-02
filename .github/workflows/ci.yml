@@ -26,3 +26,20 @@ jobs:
           shellcheck -S error ./tests/run.sh
       - name: Run tests
         run: ./tests/run.sh
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify packed contents (dry run)
+        run: npm publish --dry-run
+      - name: Clean-prefix install and smoke test
+        run: |
+          npm i -g . --prefix /tmp/memtest
+          /tmp/memtest/bin/mem --help >/dev/null
+          /tmp/memtest/bin/mem --version
+          test "$(/tmp/memtest/bin/mem --version)" = "mem 0.1.0"
