@@ -10,7 +10,7 @@ Requires bash, git, and ripgrep (`rg`).
 
 ```bash
 npm i -g @masculinecache/mem
-mem --version   # 0.1.0
+mem --version
 ```
 
 Or without npm — clone the repo and put `mem` on your `PATH`:
