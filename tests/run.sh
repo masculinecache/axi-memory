@@ -159,6 +159,30 @@ run search "pnpm" --inject
 assert_exit "inject exit 0" 0 "$RC"
 assert_has "inject has id" "$OUT" "d-"
 
+t "search fails loud when ripgrep is unavailable (exit 1, not silent 0)"
+new_sandbox
+add_mem decision "Use pnpm not npm"
+NOBIN="$(mktemp -d /tmp/mem-nobin.XXXXXX)"
+# Symlink every /usr/bin tool EXCEPT rg, then replace PATH entirely — mem runs
+# with a full toolset but no ripgrep, the exact shape of a bare CI runner.
+for f in /usr/bin/*; do
+  b="${f##*/}"
+  [ "$b" = "rg" ] && continue
+  ln -s "$f" "$NOBIN/$b" 2>/dev/null || true
+done
+OUT="$( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" PATH="$NOBIN" "$MEM_BIN" search "pnpm" 2>/dev/null )"
+RC=$?
+assert_exit "missing rg exits 1" 1 "$RC"
+assert_has "error names ripgrep" "$OUT" "ripgrep"
+rm -rf "$NOBIN"
+
+t "search with invalid regex fails loud (exit 1, not silent empty)"
+new_sandbox
+add_mem decision "Use pnpm not npm"
+run search "("
+assert_exit "invalid regex exits 1" 1 "$RC"
+assert_has "error surfaced" "$OUT" "error:"
+
 echo
 echo "== show =="
 

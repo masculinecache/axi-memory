@@ -20,6 +20,8 @@ Every GitHub operation on this repo uses the **masculinecache** account only —
   `npm i -g . --prefix /tmp/memtest` then `mem --help` / `mem --version` (also a CI `package` job).
 - **Version lives in three places that must move together**: `MEM_VERSION` in `./mem`,
   `version` in `package.json`, and the assertion in `.github/workflows/ci.yml` (`package` job).
+- GitHub `ubuntu-latest` runners do NOT ship ripgrep — the `ci` job installs it.
+  `mem search` depends on `rg` and fails loud (exit 1) when it is missing or the regex is invalid.
 - `npm publish` itself is intentionally never run by agents — publishing is a human/captain action.
 
 ## Public-docs redaction rule

@@ -18,8 +18,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install shellcheck and ripgrep
+        run: sudo apt-get update && sudo apt-get install -y shellcheck ripgrep
       - name: Shellcheck
         run: |
           shellcheck -S error ./mem
