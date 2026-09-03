@@ -4,6 +4,54 @@ Filesystem + git agent memory CLI with TOON output. Durable memory that survives
 
 Following the [AXI 10 principles](https://axi.md): TOON output, minimal schemas, content-first home view, truncation with `--full`, definitive empty states, structured errors on stdout, exit 0/1/2.
 
+## Install
+
+Requires bash, git, and ripgrep (`rg`).
+
+```bash
+npm i -g @masculinecache/mem
+mem --version
+```
+
+Or without npm — clone the repo and put `mem` on your `PATH`:
+
+```bash
+git clone https://github.com/masculinecache/axi-memory.git
+ln -s "$(pwd)/axi-memory/mem" ~/.local/bin/mem
+```
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [docs/design.md](docs/design.md) | Why filesystem + git + markdown; the memory model; triage; L0 abstracts; ranking/lifecycle; sync model; search strategy |
+| [docs/integration.md](docs/integration.md) | Harness-neutral integration: the shell / tool / hook surfaces, tool mapping, recall and capture patterns |
+| [docs/harnesses.md](docs/harnesses.md) | Survey of hook/lifecycle equivalents across agent harnesses (Claude Code, Codex, pi, Grok, Kimi) |
+
+## Architecture
+
+How a lesson becomes durable, from triage to cross-machine sync:
+
+```mermaid
+flowchart TD
+    cue["Lesson surfaces during a session"] --> triage{"Triage"}
+    triage -->|"multi-step hard-won procedure"| skill["Skill candidate (procedure doc)"]
+    triage -->|"one-line fact / decision / preference"| note["Memory note"]
+    triage -->|"only useful this session"| skip["Skip - do not capture"]
+    skill --> gate{"Promotion gate"}
+    gate -->|"verified, repeatable, named failure, dead end ruled out"| promote["Skill library"]
+    gate -->|"falls short"| low["Low-confidence memory"]
+    note --> distill{"Distill (mem dedup)"}
+    low --> review{"Review queue (mem review)"}
+    distill -->|"near-duplicate titles merge"| store["Memory store: markdown + git, one commit per write"]
+    store -->|"mem sync: pull + push"| remote["Bare repo remote - cross-machine sync"]
+    store --> l0["L0 abstracts: 120-char recall lines"]
+    l0 --> recall["Recall at session start and topic shift (mem search)"]
+    review -->|"cleared or merged"| store
+    review -->|"stale or wrong"| retire["Retire (git history preserves it)"]
+    retire -. re-learned later .-> triage
+```
+
 ## Quick Start
 
 ```bash

@@ -1,0 +1,6 @@
+# Credential guard (captain order 2026-09-02): every gh operation in this repo
+# must run against the masculinecache account. mise-driven shells get these
+# automatically; export them by hand if mise is not active.
+[env]
+GH_REPO = "masculinecache/axi-memory"
+GH_CONFIG_DIR = "$HOME/.config/gh-masculinecache"

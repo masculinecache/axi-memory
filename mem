@@ -2,7 +2,7 @@
 # mem — filesystem + git agent memory CLI with TOON output
 #
 # Storage: markdown files with YAML frontmatter at $MEM_DIR/objects/<type>/<id>.md
-# Sync: git pull/push to bare repo at $MEM_REMOTE (configurable, defaults to OCI bare)
+# Sync: git pull/push to the bare repo behind the $MEM_REMOTE git remote (default: origin)
 # Search: ripgrep in v1 (literal + regex). v2 plan documented in §v2-strategy below.
 #
 # AXI compliance: TOON output, 3-4 default fields, truncation with --full, definitive empty
@@ -27,6 +27,7 @@
 set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
+MEM_VERSION="0.1.0"
 MEM_DIR="${MEM_DIR:-$HOME/memories}"
 MEM_REMOTE="${MEM_REMOTE:-origin}"
 MEM_OBJECTS="$MEM_DIR/objects"
@@ -310,10 +311,18 @@ cmd_search() {
   }
 
   # §v2-strategy: see file header. v1 uses rg literally.
-  local rg_out
+  # Fail loud over silent wrong: a missing rg or an invalid regex must surface
+  # as a structured error, never as a definitive-looking "0 of 0" empty state.
+  command -v rg >/dev/null 2>&1 || \
+    die "ripgrep (rg) is required for search but not installed" 1 \
+        "install ripgrep: https://github.com/BurntSushi/ripgrep#installation"
+  local rg_out rg_rc=0
   rg_out=$(rg -l --no-heading -i --max-count 1 \
     -g '*.md' \
-    "$query" "$search_root" 2>/dev/null || true)
+    "$query" "$search_root" 2>/dev/null) || rg_rc=$?
+  (( rg_rc == 2 )) && \
+    die "search pattern failed (invalid regex?)" 1 \
+        "escape regex metacharacters, or quote the query to search literally"
   local -a files=()
   if [[ -n "$rg_out" ]]; then
     while IFS= read -r f; do
@@ -1289,6 +1298,7 @@ Commands:
   sync             git pull --rebase && git push
   stats            show usage statistics
   --help           this message
+  --version        print version and exit
 
 Configuration (env):
   MEM_DIR          path to memory store (default: $HOME/memories)
@@ -1578,6 +1588,10 @@ main() {
   local cmd="$1"
   if [[ "$cmd" == "--help" || "$cmd" == "-h" || "$cmd" == "help" ]]; then
     cmd_help_top
+    return 0
+  fi
+  if [[ "$cmd" == "--version" || "$cmd" == "-V" || "$cmd" == "version" ]]; then
+    printf 'mem %s\n' "$MEM_VERSION"
     return 0
   fi
   shift
