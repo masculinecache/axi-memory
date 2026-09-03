@@ -1,5 +1,5 @@
 {
-  "name": "@masculinecache/mem",
+  "name": "@masculinecache/mem-axi",
   "version": "0.1.0",
   "description": "Filesystem + git agent memory CLI with TOON output — durable, portable memory for coding agents",
   "bin": {
