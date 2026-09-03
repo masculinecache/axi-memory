@@ -9,7 +9,7 @@ Following the [AXI 10 principles](https://axi.md): TOON output, minimal schemas,
 Requires bash, git, and ripgrep (`rg`).
 
 ```bash
-npm i -g @masculinecache/mem
+npm i -g @masculinecache/mem-axi
 mem --version
 ```
 
