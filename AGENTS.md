@@ -9,6 +9,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 Every GitHub operation on this repo uses the **masculinecache** account only — never global personal credentials.
 
 - `gh`/`gh-axi` calls: export `GH_CONFIG_DIR=$HOME/.config/gh-masculinecache` first; never rely on ambient gh config.
+- The committed `.mise.toml` carries this rule for mise-driven shells: `GH_REPO=masculinecache/axi-memory`, `GH_CONFIG_DIR=$HOME/.config/gh-masculinecache`. If mise is not active, export them by hand.
 - `git push` already works as masculinecache via the repo-local credential helper — do not alter it.
 - On gh auth failure (403/wrong account): stop and report blocked; never retry with different credentials.
 
