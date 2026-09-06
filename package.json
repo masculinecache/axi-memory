@@ -35,6 +35,7 @@
     "url": "https://github.com/masculinecache/axi-memory/issues"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   }
 }
