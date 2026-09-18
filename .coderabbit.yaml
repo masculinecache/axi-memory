@@ -1,0 +1,13 @@
+reviews:
+  profile: "assertive"
+  path_filters:
+    - "!**/node_modules/**"
+    - "!**/*.lock"
+    - "!**/package-lock.json"
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        Focus on data persistence and retrieval patterns.
+        Check memory schema migrations are backwards compatible.
+        Verify indexing strategy supports efficient queries.
+        Flag hardcoded paths that break portability.
