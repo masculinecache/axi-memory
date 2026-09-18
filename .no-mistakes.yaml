@@ -1,9 +1,4 @@
-agent_config:
-  model: fallback/gate
-  fallback_model: opencode-go/deepseek-v4-flash
-
-delivery:
-  mode: no-mistakes
+agent: pi
 
 auto_fix:
   rebase: 1
