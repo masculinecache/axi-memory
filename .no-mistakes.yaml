@@ -7,3 +7,6 @@ auto_fix:
   review: 0
   document: 1
   ci: 1
+
+# Suppress project-level agent settings for minimal Pi profile
+disable_project_settings: true
