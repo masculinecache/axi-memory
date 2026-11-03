@@ -38,8 +38,8 @@ new_sandbox() {
   rm -rf "$SANDBOX_DIR"
   mkdir -p "$SANDBOX_DIR"
   export MEM_DIR="$SANDBOX_DIR/memories"
-  # init idempotently
-  ( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" "$MEM_BIN" init >/dev/null 2>&1 )
+  # init idempotently (uses standalone per new contract)
+  ( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" "$MEM_BIN" init --mode standalone >/dev/null 2>&1 )
 }
 
 run() {
@@ -79,13 +79,50 @@ assert_has "recent shows the title" "$OUT" "Use pnpm not npm"
 echo
 echo "== init =="
 
-t "init is idempotent (rerun succeeds)"
+t "init without --mode prints structured two-mode question and exits 2"
 new_sandbox
 run init
-assert_exit "init first run exit 0" 0 "$RC"
-run init
-assert_exit "init second run exit 0" 0 "$RC"
-assert_nz "init created .git" "$(git -C "$MEM_DIR" rev-parse --is-inside-work-tree 2>/dev/null)"
+assert_exit "no-mode init exit 2" 2 "$RC"
+assert_has "mentions --mode" "$OUT" "--mode"
+assert_has "standalone" "$OUT" "standalone"
+assert_has "edge" "$OUT" "edge"
+
+t "init --mode standalone is idempotent, creates git with no remote"
+new_sandbox
+run init --mode standalone
+assert_exit "standalone init exit 0" 0 "$RC"
+assert_nz "created .git" "$(git -C "$MEM_DIR" rev-parse --is-inside-work-tree 2>/dev/null || echo '')"
+if ! git -C "$MEM_DIR" remote get-url origin >/dev/null 2>&1; then
+  ok
+else
+  bad "standalone should have no remote"
+fi
+
+t "init --mode edge without --collector exits 2 with hint"
+new_sandbox
+run init --mode edge
+assert_exit "edge no-collector exit 2" 2 "$RC"
+assert_has "requires --collector" "$OUT" "--collector"
+
+t "--mode edge with collector sets up remote (temp key to avoid live ~/.ssh)"
+new_sandbox
+TEST_KEY="/tmp/memtest-key-$$"
+MEM_SSH_KEY_PATH="$TEST_KEY" run init --mode edge --collector testuser@testhost:/tmp/mem-bare.git
+assert_exit "edge init exit 0" 0 "$RC"
+assert_has "generated" "$OUT" "generated"
+assert_has "ssh-config" "$OUT" "ssh-config"
+assert_has "origin remote" "$OUT" "testhost"
+rm -f "$TEST_KEY" "$TEST_KEY.pub" 2>/dev/null || true
+# verify remote set
+remote_url=$(git -C "$MEM_DIR" remote get-url origin 2>/dev/null || echo "none")
+assert_has "remote set to alias:path" "$remote_url" "mem-testhost:/tmp/mem-bare.git"
+
+t "sync skips with message (exit 0) when no remote configured"
+new_sandbox
+run init --mode standalone
+run sync
+assert_exit "sync no-remote exit 0" 0 "$RC"
+assert_has "skipped: no remote configured" "$OUT" "skipped: no remote"
 
 echo
 echo "== add =="
