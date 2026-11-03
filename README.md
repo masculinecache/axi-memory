@@ -56,7 +56,9 @@ flowchart TD
 
 ```bash
 # Initialize (idempotent)
-mem init
+mem init --mode standalone
+# For SSH collector sync on fresh machine:
+# mem init --mode edge --collector user@host:/path/to/mem-bare.git
 
 # Add a memory
 mem add --type decision --title "Use pnpm not npm" --body "Lockfile determinism matters" --tags "tooling,frontend" --priority 80
@@ -105,10 +107,11 @@ help[3]:
 ```
 
 ### `mem init` — Initialize Store
-Creates the directory structure and git repo. Idempotent.
+Two modes for fresh machines (non-interactive). Defaults to structured prompt without `--mode`.
 
 ```bash
-mem init
+mem init --mode standalone          # local git only
+mem init --mode edge --collector user@host:/path/to/bare.git  # + dedicated SSH key + managed config
 ```
 
 ### `mem add` — Create Memory
@@ -204,6 +207,7 @@ Shows store path, memory count, disk usage, remote URL + reachability, sync stat
 mem sync
 ```
 Pulls with `--rebase` (30s timeout), then pushes. Reports unpushed/unpulled counts.
+With no remote configured (e.g. standalone init) it skips with a message and exits 0.
 
 ### `mem stats` — Usage Statistics
 ```bash
@@ -260,7 +264,7 @@ count: 0 of 0 total
 Local: `$MEM_DIR` (working dir with `.git/`)
 Remote: bare repo at `$MEM_REMOTE` (default `origin`)
 
-`mem sync` = `git pull --rebase && git push`. Conflicts are git conflicts — resolve manually.
+`mem sync` = `git pull --rebase && git push`; with no remote configured it skips (exit 0). Conflicts are git conflicts — resolve manually.
 
 ## License
 

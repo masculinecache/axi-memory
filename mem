@@ -27,7 +27,7 @@
 set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
-MEM_VERSION="0.1.0"
+MEM_VERSION="0.2.0"
 MEM_DIR="${MEM_DIR:-$HOME/memories}"
 MEM_REMOTE="${MEM_REMOTE:-origin}"
 MEM_OBJECTS="$MEM_DIR/objects"
@@ -193,6 +193,74 @@ ensure_repo() {
   [[ -d "$MEM_OBJECTS" ]] || die "objects/ missing at $MEM_OBJECTS" 1
 }
 
+# Helpers for `mem init --mode edge` (SSH collector wiring, per captain spec).
+# Key, ssh-config, remote URL parsing — isolated to these functions.
+parse_collector() {
+  local spec="$1"
+  if [[ -z "$spec" || ! "$spec" =~ ^[^@]+@[^:]+: ]]; then
+    die "invalid --collector '$spec' (expected user@host:/path/to/bare.git)" 2
+  fi
+  local user_host="${spec%%:*}" path="${spec#*:}" user host alias
+  user="${user_host%@*}"
+  host="${user_host#*@}"
+  alias="mem-${host%%.*}"  # deterministic short alias e.g. mem-edgehost
+  printf '%s|%s|%s|%s' "$user" "$host" "$path" "$alias"
+}
+
+ensure_mem_git_key() {
+  local key_path="${MEM_SSH_KEY_PATH:-$HOME/.ssh/id_ed25519_memgit}"
+  local pub_path="${key_path}.pub"
+  if [[ -f "$key_path" ]]; then
+    printf 'mem: dedicated key already exists at %s\n' "$key_path"
+    printf 'pubkey_path: %s\n' "$pub_path"
+    die "refusing to overwrite existing mem key" 1 "rm $key_path $pub_path to regenerate"
+  fi
+  mkdir -p "$(dirname "$key_path")"
+  chmod 700 "$(dirname "$key_path")" 2>/dev/null || true
+  ssh-keygen -t ed25519 -N "" -f "$key_path" -C "mem@$(hostname -s)" >/dev/null 2>&1 \
+    || die "ssh-keygen failed" 1
+  chmod 600 "$key_path"
+  chmod 644 "$pub_path" 2>/dev/null || true
+  printf 'mem: generated Ed25519 keypair (no passphrase) at %s\n' "$key_path"
+}
+
+write_mem_ssh_config() {
+  local alias="$1" user="$2" host="$3" key_path="$4"
+  local config_dir="$HOME/.config/mem"
+  local config_file="$config_dir/ssh-config"
+  local stanza="" content="" new_content=""
+  stanza="Host $alias
+  HostName $host
+  User $user
+  IdentityFile $key_path
+  IdentitiesOnly yes"
+  mkdir -p "$config_dir"
+  chmod 700 "$config_dir" 2>/dev/null || true
+  if [[ -f "$config_file" ]]; then
+    content=$(cat "$config_file")
+    if [[ "$content" == *"$stanza"* ]]; then
+      printf 'mem: ssh-config stanza for %s already present\n' "$alias"
+      return 0
+    fi
+    new_content=$(awk -v a="$alias" '
+      /^#/ { next }
+      /^Host / { skip = ($2 == a) }
+      !skip { print }
+    ' "$config_file")
+  fi
+  {
+    printf '%s\n' '# mem init --mode edge managed file — do not edit by hand'
+    [[ -n "$new_content" ]] && printf '\n%s' "$new_content"
+    printf '\n%s\n' "$stanza"
+  } > "$config_file"
+  chmod 600 "$config_file"
+  if [[ -n "$content" ]]; then
+    printf 'mem: updated ssh-config stanza for %s\n' "$alias"
+  else
+    printf 'mem: wrote managed ssh-config: %s\n' "$config_file"
+  fi
+}
+
 # TOON list row printer. Reads stdin lines: id|type|title|confidence
 print_toon_list() {
   local header="$1"  # e.g. results{rownyield}
@@ -261,25 +329,116 @@ cmd_home() {
 
 cmd_init() {
   [[ $# -gt 0 && ( "$1" == "--help" || "$1" == "-h" ) ]] && { cmd_init_help; return 0; }
-  # Always idempotent — §6
+  local mode="" collector=""
+  while (($#)); do
+    case "$1" in
+      --mode)
+        [[ $# -ge 2 ]] || die "--mode requires a value" 2 "valid: --mode standalone | --mode edge --collector <user@host:path>"
+        mode="$2"; shift 2 ;;
+      --collector)
+        [[ $# -ge 2 ]] || die "--collector requires a value" 2 "valid: --mode edge --collector <user@host:path>"
+        collector="$2"; shift 2 ;;
+      --help|-h)   cmd_init_help; return 0 ;;
+      --*)         die "unknown flag $1 for init" 2 "valid: --mode standalone | --mode edge --collector <user@host:path>" ;;
+      *)           die "init accepts only flags (no positional args)" 2 ;;
+    esac
+  done
+
+  # Per spec: no --mode prints two-mode question and exits (non-interactive, structured)
+  if [[ -z "$mode" ]]; then
+    printf 'mem: init requires --mode (non-interactive)\n'
+    printf 'mode[2]{mode,description}:\n'
+    printf '  standalone,initialize local memory dir as plain git repo (no remote)\n'
+    printf '  edge,initialize + SSH collector wiring with dedicated key (--collector required)\n'
+    printf 'help[2]:\n'
+    printf '  mem init --mode standalone\n'
+    printf '  mem init --mode edge --collector user@host:/path/to/mem-bare.git\n'
+    exit 2
+  fi
+
+  [[ "$mode" != "standalone" && "$mode" != "edge" ]] && \
+    die "unknown --mode '$mode'" 2 "valid: standalone, edge"
+
+  if [[ "$mode" == "edge" && -z "$collector" ]]; then
+    die "--mode edge requires --collector <user@host:bare-repo-path>" 2 \
+      "example: --collector phillias@edgehost:/home/phillias/mem-bare.git"
+  fi
+
+  # Always idempotent local init (dirs + git + gitignore + user config)
   mkdir -p "$MEM_OBJECTS"
   for t in "${ORDERED_TYPES[@]}"; do
     mkdir -p "$MEM_OBJECTS/${TYPE_DIR[$t]}"
   done
+  local initialized=0
   if [[ ! -d "$MEM_DIR/.git" ]]; then
-    # -C is a global option — must precede the subcommand. `git init -C <dir>`
-    # is invalid and silently failed, leaving a store with no repo.
     git -C "$MEM_DIR" init >/dev/null 2>&1
     git -C "$MEM_DIR" config user.name "mem-anchor"
     git -C "$MEM_DIR" config user.email "masculinecache@users.noreply.github.com"
-    printf 'mem: initialized at %s\n' "$MEM_DIR"
+    printf 'mem: initialized git repo at %s\n' "$MEM_DIR"
+    initialized=1
   else
-    printf 'mem: already initialized at %s (no-op)\n' "$MEM_DIR"
+    printf 'mem: already initialized at %s\n' "$MEM_DIR"
   fi
   if [[ ! -f "$MEM_DIR/.gitignore" ]]; then
     printf '.cache/\n' > "$MEM_DIR/.gitignore"
   fi
-  printf 'help[1]:\n  Run `mem add --type constraint --title "Use pnpm"` to add your first memory\n'
+
+  if [[ "$mode" == "edge" ]]; then
+    local parsed user host bare_path alias
+    # Validate BEFORE the $(...) substitution: a die() inside a command
+    # substitution is captured into the buffer and discarded, which would turn
+    # a malformed --collector into a silent exit 2 with no error text.
+    if [[ -z "$collector" || ! "$collector" =~ ^[^@]+@[^:]+: ]]; then
+      die "invalid --collector '$collector' (expected user@host:/path/to/bare.git)" 2
+    fi
+    parsed=$(parse_collector "$collector")
+    IFS='|' read -r user host bare_path alias <<< "$parsed"
+
+    local key_path="${MEM_SSH_KEY_PATH:-$HOME/.ssh/id_ed25519_memgit}"
+    local pub_path="${key_path}.pub"
+
+    ensure_mem_git_key
+    write_mem_ssh_config "$alias" "$user" "$host" "$key_path"
+
+    # Set the configured remote ($MEM_REMOTE, default origin) to alias:path form
+    local remote_url="${alias}:${bare_path}"
+    if git -C "$MEM_DIR" remote get-url "$MEM_REMOTE" >/dev/null 2>&1; then
+      local existing_url
+      existing_url=$(git -C "$MEM_DIR" remote get-url "$MEM_REMOTE")
+      if [[ "$existing_url" != "$remote_url" ]]; then
+        git -C "$MEM_DIR" remote set-url "$MEM_REMOTE" "$remote_url"
+        printf 'mem: updated %s remote to %s\n' "$MEM_REMOTE" "$remote_url"
+      else
+        printf 'mem: %s already points to %s\n' "$MEM_REMOTE" "$remote_url"
+      fi
+    else
+      git -C "$MEM_DIR" remote add "$MEM_REMOTE" "$remote_url"
+      printf 'mem: added %s remote %s\n' "$MEM_REMOTE" "$remote_url"
+    fi
+
+    # Print user instructions (copy-pasteable, non-interactive)
+    printf '\n=== SSH edge collector setup (one-time) ===\n'
+    printf '1. Add to your ~/.ssh/config (exactly once):\n'
+    printf '   Include ~/.config/mem/ssh-config\n\n'
+    printf '2. On collector (%s), append to ~/.ssh/authorized_keys:\n' "$host"
+    local pubkey_content
+    pubkey_content=$(cat "$pub_path" 2>/dev/null || echo "ERROR: no pubkey")
+    # No command="..." restriction: pull needs git-upload-pack and push needs
+    # git-receive-pack on the collector, and step 4's probe runs an arbitrary
+    # command — a forced receive-pack would break all three.
+    printf '   no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding %s\n' "$pubkey_content"
+    printf '\n3. Public key file: %s\n' "$pub_path"
+    printf '   (copy the ssh-ed25519 line above or cat it)\n'
+    printf '4. Test connectivity: ssh %s "git --version"\n' "$alias"
+    printf '5. Run: mem sync\n'
+    printf 'help: GitHub-hosted or D1 backends tracked in masculinecache/axi-memory#16\n'
+  else
+    printf 'mem: standalone mode complete (no remote; sync will skip)\n'
+  fi
+
+  if [[ $initialized -eq 1 ]]; then
+    printf 'help[1]:\n  Run `mem add --type constraint --title "Use pnpm"` to add your first memory\n'
+  fi
 }
 
 cmd_search() {
@@ -726,6 +885,14 @@ cmd_review() {
 
 cmd_sync() {
   [[ $# -gt 0 && ( "$1" == "--help" || "$1" == "-h" ) ]] && { cmd_sync_help; return 0; }
+  if [[ ! -d "$MEM_DIR/.git" ]]; then
+    printf 'sync:\n  skipped: mem store not initialized (run: mem init)\n'
+    return 0
+  fi
+  if ! git -C "$MEM_DIR" remote get-url "$MEM_REMOTE" >/dev/null 2>&1; then
+    printf 'sync:\n  skipped: no remote configured\n'
+    return 0
+  fi
   ensure_repo
   local status=0 output
   local sync_timeout=30
@@ -738,8 +905,28 @@ cmd_sync() {
   local branch
   branch=$(git -C "$MEM_DIR" config init.defaultBranch 2>/dev/null || echo master)
 
-  # Pull first to grab latest from the anchor
-  if output=$(timeout "$sync_timeout" git -C "$MEM_DIR" pull --rebase "$MEM_REMOTE" "$branch" 2>&1); then
+  # Pull first to grab latest from the anchor. A fresh (empty) collector has no
+  # branch refs yet, so a pull would fail with "couldn't find remote ref" and
+  # block the very first push (mem init --mode edge wires up a brand-new bare
+  # repo). Probe the remote branch with ls-remote first: no matching ref means
+  # there is nothing to pull, so push below may proceed.
+  local pull_status=0
+  local ls_rc
+  if timeout "$sync_timeout" git -C "$MEM_DIR" ls-remote --exit-code "$MEM_REMOTE" "refs/heads/$branch" >/dev/null 2>&1; then
+    ls_rc=0
+  else
+    ls_rc=$?
+  fi
+  if [ "$ls_rc" -eq 124 ]; then
+    printf '  pull: timeout (%ds) — remote %s unreachable\n' "$sync_timeout" "$MEM_REMOTE"
+    pull_status=1
+  elif [ "$ls_rc" -eq 2 ]; then
+    # Remote reachable but has no commits on $branch yet (fresh collector).
+    printf '  pull: nothing to pull (no commits on %s yet)\n' "$branch"
+  elif [ "$ls_rc" -ne 0 ]; then
+    printf '  pull: cannot reach remote %s (ls-remote exit %d)\n' "$MEM_REMOTE" "$ls_rc"
+    pull_status=1
+  elif output=$(timeout "$sync_timeout" git -C "$MEM_DIR" pull --rebase "$MEM_REMOTE" "$branch" 2>&1); then
     printf '  pull: ok\n'
   else
     local code=$?
@@ -748,11 +935,11 @@ cmd_sync() {
     else
       printf '  pull: %s\n' "$(printf '%s' "$output" | tail -3 | tr '\n' ' ')"
     fi
-    status=1
+    pull_status=1
   fi
 
   # Push our changes (skip if pull failed — push would also hang)
-  if [ "$status" -eq 0 ]; then
+  if [ "$pull_status" -eq 0 ]; then
     if output=$(timeout "$sync_timeout" git -C "$MEM_DIR" push "$MEM_REMOTE" HEAD 2>&1); then
       printf '  push: ok\n'
     else
@@ -1259,19 +1446,24 @@ cmd_dedup() {
 
 cmd_init_help() {
   cat <<'EOF'
-mem init — initialize the memory store at $MEM_DIR (idempotent)
+mem init — initialize memory store (two modes; non-interactive)
 
-Usage: mem init
+Usage:
+  mem init --mode standalone
+  mem init --mode edge --collector <user@host:/bare/repo/path>
 
-Creates the directory structure:
-  $MEM_DIR/objects/{constraints,decisions,failures,howtos,preferences}/
-  $MEM_DIR/.git/                  (git repository)
-  $MEM_DIR/.gitignore             (ignores .cache/)
+Modes:
+  standalone   local git repo only (no remote; sync skips)
+  edge         local + dedicated Ed25519 SSH key + managed ~/.config/mem/ssh-config
+               + sets the configured remote (default origin) to alias:path form. Prints copy-paste instructions.
 
-Safe to run multiple times — only creates missing directories/files.
+Never reads stdin, never overwrites existing key at ~/.ssh/id_ed25519_memgit,
+never edits ~/.ssh/config (prints Include line instead). Idempotent.
 
-Configuration:
-  MEM_DIR  path to memory store (default: $HOME/memories)
+--mode edge without --collector exits 2 with hint.
+MEM_DIR env controls store location (default ~/memories).
+
+See `mem init` (no flags) for structured mode prompt.
 EOF
 }
 
@@ -1285,7 +1477,7 @@ Usage: mem [<command>] [<args>]
 
 Commands:
   (no args)        show recent + status (content-first home view)
-  init             initialize mem store at $MEM_DIR (idempotent)
+  init             initialize (--mode standalone | --mode edge --collector ...)
   search <query>   ripgrep search across all memories (priority-ranked)
   show <id>        full detail (body truncated by default; use --full)
   add              create a new memory
@@ -1525,22 +1717,24 @@ EOF
 
 cmd_sync_help() {
   cat <<'EOF'
-mem sync — git pull --rebase && git push to the configured remote
+mem sync — git pull --rebase && git push (or skip)
 
 Usage: mem sync
 
 Behavior:
-  - Pulls from the remote (default: origin) with 30s timeout
-  - Pushes local commits if pull succeeded
-  - Reports sync state: unpushed/unpulled commit counts
+  - If no git repo: skipped (run mem init)
+  - If no remote configured: skipped with message, exit 0
+  - Otherwise: pull --rebase then push, with 30s timeout per op
+  - Reports unpushed/unpulled counts
 
 Remote configuration:
   MEM_REMOTE  git remote name (default: origin)
+  (set by mem init --mode edge)
 
 Notes:
   - Uses timeout(1) to prevent hanging on unreachable remotes
   - Pull uses --rebase to keep history linear
-  - SSH keepalive config lives in ~/.ssh/config
+  - SSH keepalive / key config lives in ~/.ssh/config + managed Include
 EOF
 }
 

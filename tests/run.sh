@@ -38,8 +38,8 @@ new_sandbox() {
   rm -rf "$SANDBOX_DIR"
   mkdir -p "$SANDBOX_DIR"
   export MEM_DIR="$SANDBOX_DIR/memories"
-  # init idempotently
-  ( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" "$MEM_BIN" init >/dev/null 2>&1 )
+  # init idempotently (uses standalone per new contract)
+  ( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" "$MEM_BIN" init --mode standalone >/dev/null 2>&1 )
 }
 
 run() {
@@ -79,13 +79,153 @@ assert_has "recent shows the title" "$OUT" "Use pnpm not npm"
 echo
 echo "== init =="
 
-t "init is idempotent (rerun succeeds)"
+t "init without --mode prints structured two-mode question and exits 2"
 new_sandbox
 run init
-assert_exit "init first run exit 0" 0 "$RC"
-run init
-assert_exit "init second run exit 0" 0 "$RC"
-assert_nz "init created .git" "$(git -C "$MEM_DIR" rev-parse --is-inside-work-tree 2>/dev/null)"
+assert_exit "no-mode init exit 2" 2 "$RC"
+assert_has "mentions --mode" "$OUT" "--mode"
+assert_has "standalone" "$OUT" "standalone"
+assert_has "edge" "$OUT" "edge"
+
+t "init --mode standalone is idempotent, creates git with no remote"
+new_sandbox
+run init --mode standalone
+assert_exit "standalone init exit 0" 0 "$RC"
+assert_nz "created .git" "$(git -C "$MEM_DIR" rev-parse --is-inside-work-tree 2>/dev/null || echo '')"
+if ! git -C "$MEM_DIR" remote get-url origin >/dev/null 2>&1; then
+  ok
+else
+  bad "standalone should have no remote"
+fi
+
+t "init --mode edge without --collector exits 2 with hint"
+new_sandbox
+run init --mode edge
+assert_exit "edge no-collector exit 2" 2 "$RC"
+assert_has "requires --collector" "$OUT" "--collector"
+
+t "--mode edge with collector sets up remote (temp key + HOME to avoid live ~/.ssh and ~/.config)"
+new_sandbox
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+OUT="$( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector testuser@testhost:/tmp/mem-bare.git 2>/dev/null )"
+RC=$?
+assert_exit "edge init exit 0" 0 "$RC"
+assert_has "generated" "$OUT" "generated"
+assert_has "ssh-config" "$OUT" "ssh-config"
+assert_has "stanza written under test HOME" "$(cat "$TEST_HOME/.config/mem/ssh-config" 2>/dev/null || echo '')" "mem-testhost"
+remote_url=$(git -C "$MEM_DIR" remote get-url origin 2>/dev/null || echo "none")
+assert_has "remote set to alias:path" "$remote_url" "mem-testhost:/tmp/mem-bare.git"
+rm -rf "$TEST_HOME"
+
+# fix regression: init configures the $MEM_REMOTE remote, not a hardcoded origin
+t "edge init with custom MEM_REMOTE wires that remote name"
+new_sandbox
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+OUT="$( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_REMOTE="myremote" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector testuser@testhost:/tmp/mem-bare.git 2>/dev/null )"
+RC=$?
+assert_exit "MEM_REMOTE edge init exit 0" 0 "$RC"
+remote_url=$(git -C "$MEM_DIR" remote get-url myremote 2>/dev/null || echo "none")
+assert_has "remote created under MEM_REMOTE name" "$remote_url" "mem-testhost:/tmp/mem-bare.git"
+if git -C "$MEM_DIR" remote get-url origin >/dev/null 2>&1; then
+  bad "origin must not exist when MEM_REMOTE is custom"
+else
+  ok
+fi
+rm -rf "$TEST_HOME"
+
+# fix regression: value-taking flags with no value fail structured (exit 2), not bash trace
+t "init --mode without a value is a structured error (exit 2)"
+new_sandbox
+run init --mode
+assert_exit "missing --mode value exit 2" 2 "$RC"
+assert_has "structured error on stdout" "$OUT" "error:"
+
+t "init --collector without a value is a structured error (exit 2)"
+new_sandbox
+run init --mode edge --collector
+assert_exit "missing --collector value exit 2" 2 "$RC"
+assert_has "error names --collector" "$OUT" "--collector"
+
+# fix regression: re-init against the same alias with a changed collector rewrites the stanza
+t "re-init edge with changed collector updates the ssh-config stanza"
+new_sandbox
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector user1@edgehost.example.com:/p1 >/dev/null 2>&1 )
+rm -f "$TEST_KEY" "$TEST_KEY.pub"
+( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector user2@edgehost.otherdomain.com:/p2 >/dev/null 2>&1 )
+SSHCFG="$(cat "$TEST_HOME/.config/mem/ssh-config" 2>/dev/null || echo '')"
+assert_has "stanza updated to new HostName" "$SSHCFG" "edgehost.otherdomain.com"
+if [[ "$SSHCFG" == *"edgehost.example.com"* ]]; then
+  bad "stale HostName still present"
+else
+  ok
+fi
+assert_has "stanza updated to new User" "$SSHCFG" "user2"
+remote_url=$(git -C "$MEM_DIR" remote get-url origin 2>/dev/null || echo "none")
+assert_has "remote follows the new collector" "$remote_url" "mem-edgehost:/p2"
+rm -rf "$TEST_HOME"
+
+t "sync skips with message (exit 0) when no remote configured"
+new_sandbox
+run init --mode standalone
+run sync
+assert_exit "sync no-remote exit 0" 0 "$RC"
+assert_has "skipped: no remote configured" "$OUT" "skipped: no remote"
+
+# fix regression: pull-first sync deadlocks on a fresh (empty) collector — the
+# first sync must still push (no "couldn't find remote ref" -> push skipped)
+t "first sync pushes the initial commit to a fresh empty collector"
+new_sandbox
+COLL="$(mktemp -d /tmp/mem-coll.XXXXXX)"
+git init --bare -q "$COLL/collector.git"
+run init --mode standalone
+git -C "$MEM_DIR" remote add origin "$COLL/collector.git"
+add_mem constraint "First memory"
+run sync
+assert_exit "first sync exit 0" 0 "$RC"
+assert_has "first sync pushes" "$OUT" "push: ok"
+COLL_BRANCHES="$(git --git-dir="$COLL/collector.git" for-each-ref --format='%(refname)' refs/heads 2>/dev/null)"
+assert_nz "collector received the branch" "$COLL_BRANCHES"
+run sync
+assert_exit "second sync exit 0" 0 "$RC"
+assert_has "second sync pulls" "$OUT" "pull: ok"
+rm -rf "$COLL"
+
+# fix regression: a malformed --collector must surface the structured error on
+# stdout (a die() inside the $(...) substitution was being swallowed, leaving
+# a bare exit 2 with no explanation)
+t "invalid --collector is a structured error on stdout (exit 2)"
+new_sandbox
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+OUT="$( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector garbage-no-at 2>/dev/null )"
+RC=$?
+assert_exit "invalid collector exit 2" 2 "$RC"
+assert_has "structured error names collector" "$OUT" "error: invalid --collector"
+assert_has "error shows expected format" "$OUT" "user@host:/path/to/bare.git"
+rm -rf "$TEST_HOME"
+
+# fix regression: the printed authorized_keys line must not force a git command
+# (a forced receive-pack blocks git-upload-pack, so following the printed
+# instructions would make `mem sync`'s pull fail forever)
+t "printed authorized_keys line has no forced command (pull stays possible)"
+new_sandbox
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+OUT="$( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector testuser@testhost:/tmp/mem-bare.git 2>/dev/null )"
+RC=$?
+assert_exit "edge init exit 0" 0 "$RC"
+AUTH="$(printf '%s\n' "$OUT" | sed -n 's/^   no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding //p')"
+assert_nz "printed authorized_keys line extracted" "$AUTH"
+case "$AUTH" in
+  *'command='*) bad "authorized_keys line must not force a command (blocks git-upload-pack/pull): $AUTH" ;;
+  *) ok ;;
+esac
+assert_has "line carries the generated public key" "$AUTH" "ssh-ed25519"
+rm -rf "$TEST_HOME"
 
 echo
 echo "== add =="

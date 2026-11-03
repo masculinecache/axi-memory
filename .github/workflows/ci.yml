@@ -42,4 +42,4 @@ jobs:
           npm i -g . --prefix /tmp/memtest
           /tmp/memtest/bin/mem --help >/dev/null
           /tmp/memtest/bin/mem --version
-          test "$(/tmp/memtest/bin/mem --version)" = "mem 0.1.0"
+          test "$(/tmp/memtest/bin/mem --version)" = "mem 0.2.0"
