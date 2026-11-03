@@ -155,8 +155,11 @@ $MEM_DIR/                  (default: $HOME/memories)
 - `MEM_DIR` relocates the store; `MEM_REMOTE` selects the git remote name
   (default `origin`).
 - `mem sync` = `git pull --rebase && git push` with a timeout so an
-  unreachable remote never hangs the CLI. Conflicts are ordinary git
-  conflicts: open the file, merge by hand, commit.
+  unreachable remote never hangs the CLI. With no remote configured it
+  skips with a message and exits 0. On a fresh collector (no branch refs
+  yet) it probes the remote branch first and pushes without pulling, so
+  the first sync after `mem init --mode edge` succeeds. Conflicts are
+  ordinary git conflicts: open the file, merge by hand, commit.
 - **Sync cadence:** local commits accumulate; sync once at session end or when
   cross-machine sync is explicitly wanted. Adding is fast (one commit each);
   syncing is the only networked operation.

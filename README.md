@@ -207,6 +207,7 @@ Shows store path, memory count, disk usage, remote URL + reachability, sync stat
 mem sync
 ```
 Pulls with `--rebase` (30s timeout), then pushes. Reports unpushed/unpulled counts.
+With no remote configured (e.g. standalone init) it skips with a message and exits 0.
 
 ### `mem stats` — Usage Statistics
 ```bash
@@ -263,7 +264,7 @@ count: 0 of 0 total
 Local: `$MEM_DIR` (working dir with `.git/`)
 Remote: bare repo at `$MEM_REMOTE` (default `origin`)
 
-`mem sync` = `git pull --rebase && git push`. Conflicts are git conflicts — resolve manually.
+`mem sync` = `git pull --rebase && git push`; with no remote configured it skips (exit 0). Conflicts are git conflicts — resolve manually.
 
 ## License
 
