@@ -104,18 +104,69 @@ run init --mode edge
 assert_exit "edge no-collector exit 2" 2 "$RC"
 assert_has "requires --collector" "$OUT" "--collector"
 
-t "--mode edge with collector sets up remote (temp key to avoid live ~/.ssh)"
+t "--mode edge with collector sets up remote (temp key + HOME to avoid live ~/.ssh and ~/.config)"
 new_sandbox
-TEST_KEY="/tmp/memtest-key-$$"
-MEM_SSH_KEY_PATH="$TEST_KEY" run init --mode edge --collector testuser@testhost:/tmp/mem-bare.git
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+OUT="$( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector testuser@testhost:/tmp/mem-bare.git 2>/dev/null )"
+RC=$?
 assert_exit "edge init exit 0" 0 "$RC"
 assert_has "generated" "$OUT" "generated"
 assert_has "ssh-config" "$OUT" "ssh-config"
-assert_has "origin remote" "$OUT" "testhost"
-rm -f "$TEST_KEY" "$TEST_KEY.pub" 2>/dev/null || true
-# verify remote set
+assert_has "stanza written under test HOME" "$(cat "$TEST_HOME/.config/mem/ssh-config" 2>/dev/null || echo '')" "mem-testhost"
 remote_url=$(git -C "$MEM_DIR" remote get-url origin 2>/dev/null || echo "none")
 assert_has "remote set to alias:path" "$remote_url" "mem-testhost:/tmp/mem-bare.git"
+rm -rf "$TEST_HOME"
+
+# fix regression: init configures the $MEM_REMOTE remote, not a hardcoded origin
+t "edge init with custom MEM_REMOTE wires that remote name"
+new_sandbox
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+OUT="$( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_REMOTE="myremote" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector testuser@testhost:/tmp/mem-bare.git 2>/dev/null )"
+RC=$?
+assert_exit "MEM_REMOTE edge init exit 0" 0 "$RC"
+remote_url=$(git -C "$MEM_DIR" remote get-url myremote 2>/dev/null || echo "none")
+assert_has "remote created under MEM_REMOTE name" "$remote_url" "mem-testhost:/tmp/mem-bare.git"
+if git -C "$MEM_DIR" remote get-url origin >/dev/null 2>&1; then
+  bad "origin must not exist when MEM_REMOTE is custom"
+else
+  ok
+fi
+rm -rf "$TEST_HOME"
+
+# fix regression: value-taking flags with no value fail structured (exit 2), not bash trace
+t "init --mode without a value is a structured error (exit 2)"
+new_sandbox
+run init --mode
+assert_exit "missing --mode value exit 2" 2 "$RC"
+assert_has "structured error on stdout" "$OUT" "error:"
+
+t "init --collector without a value is a structured error (exit 2)"
+new_sandbox
+run init --mode edge --collector
+assert_exit "missing --collector value exit 2" 2 "$RC"
+assert_has "error names --collector" "$OUT" "--collector"
+
+# fix regression: re-init against the same alias with a changed collector rewrites the stanza
+t "re-init edge with changed collector updates the ssh-config stanza"
+new_sandbox
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector user1@edgehost.example.com:/p1 >/dev/null 2>&1 )
+rm -f "$TEST_KEY" "$TEST_KEY.pub"
+( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector user2@edgehost.otherdomain.com:/p2 >/dev/null 2>&1 )
+SSHCFG="$(cat "$TEST_HOME/.config/mem/ssh-config" 2>/dev/null || echo '')"
+assert_has "stanza updated to new HostName" "$SSHCFG" "edgehost.otherdomain.com"
+if [[ "$SSHCFG" == *"edgehost.example.com"* ]]; then
+  bad "stale HostName still present"
+else
+  ok
+fi
+assert_has "stanza updated to new User" "$SSHCFG" "user2"
+remote_url=$(git -C "$MEM_DIR" remote get-url origin 2>/dev/null || echo "none")
+assert_has "remote follows the new collector" "$remote_url" "mem-edgehost:/p2"
+rm -rf "$TEST_HOME"
 
 t "sync skips with message (exit 0) when no remote configured"
 new_sandbox

@@ -228,23 +228,37 @@ write_mem_ssh_config() {
   local alias="$1" user="$2" host="$3" key_path="$4"
   local config_dir="$HOME/.config/mem"
   local config_file="$config_dir/ssh-config"
-  mkdir -p "$config_dir"
-  chmod 700 "$config_dir" 2>/dev/null || true
-  # Never duplicate stanza
-  if [[ -f "$config_file" ]] && grep -q "^Host $alias\$" "$config_file" 2>/dev/null; then
-    printf 'mem: ssh-config stanza for %s already present\n' "$alias"
-    return 0
-  fi
-  cat > "$config_file" <<EOF
-# mem init --mode edge managed file — do not edit by hand
-Host $alias
+  local stanza="" content="" new_content=""
+  stanza="Host $alias
   HostName $host
   User $user
   IdentityFile $key_path
-  IdentitiesOnly yes
-EOF
+  IdentitiesOnly yes"
+  mkdir -p "$config_dir"
+  chmod 700 "$config_dir" 2>/dev/null || true
+  if [[ -f "$config_file" ]]; then
+    content=$(cat "$config_file")
+    if [[ "$content" == *"$stanza"* ]]; then
+      printf 'mem: ssh-config stanza for %s already present\n' "$alias"
+      return 0
+    fi
+    new_content=$(awk -v a="$alias" '
+      /^#/ { next }
+      /^Host / { skip = ($2 == a) }
+      !skip { print }
+    ' "$config_file")
+  fi
+  {
+    printf '%s\n' '# mem init --mode edge managed file — do not edit by hand'
+    [[ -n "$new_content" ]] && printf '\n%s' "$new_content"
+    printf '\n%s\n' "$stanza"
+  } > "$config_file"
   chmod 600 "$config_file"
-  printf 'mem: wrote managed ssh-config: %s\n' "$config_file"
+  if [[ -n "$content" ]]; then
+    printf 'mem: updated ssh-config stanza for %s\n' "$alias"
+  else
+    printf 'mem: wrote managed ssh-config: %s\n' "$config_file"
+  fi
 }
 
 # TOON list row printer. Reads stdin lines: id|type|title|confidence
@@ -318,8 +332,12 @@ cmd_init() {
   local mode="" collector=""
   while (($#)); do
     case "$1" in
-      --mode)      mode="$2"; shift 2 ;;
-      --collector) collector="$2"; shift 2 ;;
+      --mode)
+        [[ $# -ge 2 ]] || die "--mode requires a value" 2 "valid: --mode standalone | --mode edge --collector <user@host:path>"
+        mode="$2"; shift 2 ;;
+      --collector)
+        [[ $# -ge 2 ]] || die "--collector requires a value" 2 "valid: --mode edge --collector <user@host:path>"
+        collector="$2"; shift 2 ;;
       --help|-h)   cmd_init_help; return 0 ;;
       --*)         die "unknown flag $1 for init" 2 "valid: --mode standalone | --mode edge --collector <user@host:path>" ;;
       *)           die "init accepts only flags (no positional args)" 2 ;;
@@ -376,20 +394,20 @@ cmd_init() {
     ensure_mem_git_key
     write_mem_ssh_config "$alias" "$user" "$host" "$key_path"
 
-    # Set origin remote to alias:path form
+    # Set the configured remote ($MEM_REMOTE, default origin) to alias:path form
     local remote_url="${alias}:${bare_path}"
-    if git -C "$MEM_DIR" remote get-url origin >/dev/null 2>&1; then
+    if git -C "$MEM_DIR" remote get-url "$MEM_REMOTE" >/dev/null 2>&1; then
       local existing_url
-      existing_url=$(git -C "$MEM_DIR" remote get-url origin)
+      existing_url=$(git -C "$MEM_DIR" remote get-url "$MEM_REMOTE")
       if [[ "$existing_url" != "$remote_url" ]]; then
-        git -C "$MEM_DIR" remote set-url origin "$remote_url"
-        printf 'mem: updated origin remote to %s\n' "$remote_url"
+        git -C "$MEM_DIR" remote set-url "$MEM_REMOTE" "$remote_url"
+        printf 'mem: updated %s remote to %s\n' "$MEM_REMOTE" "$remote_url"
       else
-        printf 'mem: origin already points to %s\n' "$remote_url"
+        printf 'mem: %s already points to %s\n' "$MEM_REMOTE" "$remote_url"
       fi
     else
-      git -C "$MEM_DIR" remote add origin "$remote_url"
-      printf 'mem: added origin remote %s\n' "$remote_url"
+      git -C "$MEM_DIR" remote add "$MEM_REMOTE" "$remote_url"
+      printf 'mem: added %s remote %s\n' "$MEM_REMOTE" "$remote_url"
     fi
 
     # Print user instructions (copy-pasteable, non-interactive)
@@ -1408,7 +1426,7 @@ Usage:
 Modes:
   standalone   local git repo only (no remote; sync skips)
   edge         local + dedicated Ed25519 SSH key + managed ~/.config/mem/ssh-config
-               + sets origin remote to alias:path form. Prints copy-paste instructions.
+               + sets the configured remote (default origin) to alias:path form. Prints copy-paste instructions.
 
 Never reads stdin, never overwrites existing key at ~/.ssh/id_ed25519_memgit,
 never edits ~/.ssh/config (prints Include line instead). Idempotent.
