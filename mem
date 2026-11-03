@@ -385,6 +385,12 @@ cmd_init() {
 
   if [[ "$mode" == "edge" ]]; then
     local parsed user host bare_path alias
+    # Validate BEFORE the $(...) substitution: a die() inside a command
+    # substitution is captured into the buffer and discarded, which would turn
+    # a malformed --collector into a silent exit 2 with no error text.
+    if [[ -z "$collector" || ! "$collector" =~ ^[^@]+@[^:]+: ]]; then
+      die "invalid --collector '$collector' (expected user@host:/path/to/bare.git)" 2
+    fi
     parsed=$(parse_collector "$collector")
     IFS='|' read -r user host bare_path alias <<< "$parsed"
 
@@ -417,7 +423,10 @@ cmd_init() {
     printf '2. On collector (%s), append to ~/.ssh/authorized_keys:\n' "$host"
     local pubkey_content
     pubkey_content=$(cat "$pub_path" 2>/dev/null || echo "ERROR: no pubkey")
-    printf '   command="git-receive-pack '\''%s'\''",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding %s\n' "$bare_path" "$pubkey_content"
+    # No command="..." restriction: pull needs git-upload-pack and push needs
+    # git-receive-pack on the collector, and step 4's probe runs an arbitrary
+    # command — a forced receive-pack would break all three.
+    printf '   no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding %s\n' "$pubkey_content"
     printf '\n3. Public key file: %s\n' "$pub_path"
     printf '   (copy the ssh-ed25519 line above or cat it)\n'
     printf '4. Test connectivity: ssh %s "git --version"\n' "$alias"
@@ -896,8 +905,28 @@ cmd_sync() {
   local branch
   branch=$(git -C "$MEM_DIR" config init.defaultBranch 2>/dev/null || echo master)
 
-  # Pull first to grab latest from the anchor
-  if output=$(timeout "$sync_timeout" git -C "$MEM_DIR" pull --rebase "$MEM_REMOTE" "$branch" 2>&1); then
+  # Pull first to grab latest from the anchor. A fresh (empty) collector has no
+  # branch refs yet, so a pull would fail with "couldn't find remote ref" and
+  # block the very first push (mem init --mode edge wires up a brand-new bare
+  # repo). Probe the remote branch with ls-remote first: no matching ref means
+  # there is nothing to pull, so push below may proceed.
+  local pull_status=0
+  local ls_rc
+  if timeout "$sync_timeout" git -C "$MEM_DIR" ls-remote --exit-code "$MEM_REMOTE" "refs/heads/$branch" >/dev/null 2>&1; then
+    ls_rc=0
+  else
+    ls_rc=$?
+  fi
+  if [ "$ls_rc" -eq 124 ]; then
+    printf '  pull: timeout (%ds) — remote %s unreachable\n' "$sync_timeout" "$MEM_REMOTE"
+    pull_status=1
+  elif [ "$ls_rc" -eq 2 ]; then
+    # Remote reachable but has no commits on $branch yet (fresh collector).
+    printf '  pull: nothing to pull (no commits on %s yet)\n' "$branch"
+  elif [ "$ls_rc" -ne 0 ]; then
+    printf '  pull: cannot reach remote %s (ls-remote exit %d)\n' "$MEM_REMOTE" "$ls_rc"
+    pull_status=1
+  elif output=$(timeout "$sync_timeout" git -C "$MEM_DIR" pull --rebase "$MEM_REMOTE" "$branch" 2>&1); then
     printf '  pull: ok\n'
   else
     local code=$?
@@ -906,11 +935,11 @@ cmd_sync() {
     else
       printf '  pull: %s\n' "$(printf '%s' "$output" | tail -3 | tr '\n' ' ')"
     fi
-    status=1
+    pull_status=1
   fi
 
   # Push our changes (skip if pull failed — push would also hang)
-  if [ "$status" -eq 0 ]; then
+  if [ "$pull_status" -eq 0 ]; then
     if output=$(timeout "$sync_timeout" git -C "$MEM_DIR" push "$MEM_REMOTE" HEAD 2>&1); then
       printf '  push: ok\n'
     else

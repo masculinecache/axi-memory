@@ -175,6 +175,58 @@ run sync
 assert_exit "sync no-remote exit 0" 0 "$RC"
 assert_has "skipped: no remote configured" "$OUT" "skipped: no remote"
 
+# fix regression: pull-first sync deadlocks on a fresh (empty) collector — the
+# first sync must still push (no "couldn't find remote ref" -> push skipped)
+t "first sync pushes the initial commit to a fresh empty collector"
+new_sandbox
+COLL="$(mktemp -d /tmp/mem-coll.XXXXXX)"
+git init --bare -q "$COLL/collector.git"
+run init --mode standalone
+git -C "$MEM_DIR" remote add origin "$COLL/collector.git"
+add_mem constraint "First memory"
+run sync
+assert_exit "first sync exit 0" 0 "$RC"
+assert_has "first sync pushes" "$OUT" "push: ok"
+COLL_BRANCHES="$(git --git-dir="$COLL/collector.git" for-each-ref --format='%(refname)' refs/heads 2>/dev/null)"
+assert_nz "collector received the branch" "$COLL_BRANCHES"
+run sync
+assert_exit "second sync exit 0" 0 "$RC"
+assert_has "second sync pulls" "$OUT" "pull: ok"
+rm -rf "$COLL"
+
+# fix regression: a malformed --collector must surface the structured error on
+# stdout (a die() inside the $(...) substitution was being swallowed, leaving
+# a bare exit 2 with no explanation)
+t "invalid --collector is a structured error on stdout (exit 2)"
+new_sandbox
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+OUT="$( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector garbage-no-at 2>/dev/null )"
+RC=$?
+assert_exit "invalid collector exit 2" 2 "$RC"
+assert_has "structured error names collector" "$OUT" "error: invalid --collector"
+assert_has "error shows expected format" "$OUT" "user@host:/path/to/bare.git"
+rm -rf "$TEST_HOME"
+
+# fix regression: the printed authorized_keys line must not force a git command
+# (a forced receive-pack blocks git-upload-pack, so following the printed
+# instructions would make `mem sync`'s pull fail forever)
+t "printed authorized_keys line has no forced command (pull stays possible)"
+new_sandbox
+TEST_HOME="$(mktemp -d /tmp/mem-home.XXXXXX)"
+TEST_KEY="$TEST_HOME/id_ed25519_memgit"
+OUT="$( cd "$REPO_ROOT" && MEM_DIR="$MEM_DIR" HOME="$TEST_HOME" MEM_SSH_KEY_PATH="$TEST_KEY" "$MEM_BIN" init --mode edge --collector testuser@testhost:/tmp/mem-bare.git 2>/dev/null )"
+RC=$?
+assert_exit "edge init exit 0" 0 "$RC"
+AUTH="$(printf '%s\n' "$OUT" | sed -n 's/^   no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding //p')"
+assert_nz "printed authorized_keys line extracted" "$AUTH"
+case "$AUTH" in
+  *'command='*) bad "authorized_keys line must not force a command (blocks git-upload-pack/pull): $AUTH" ;;
+  *) ok ;;
+esac
+assert_has "line carries the generated public key" "$AUTH" "ssh-ed25519"
+rm -rf "$TEST_HOME"
+
 echo
 echo "== add =="
 
