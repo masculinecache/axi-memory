@@ -1,0 +1,7 @@
+S12b: invalid collector 'garbage-no-at' (fresh sandbox)
+exit code: 2
+--- stdout ---
+| mem: initialized git repo at /tmp/mem-scenarios/s12b-mem
+--- stderr ---
+
+expected per contract: 'error: invalid --collector ...' on stdout

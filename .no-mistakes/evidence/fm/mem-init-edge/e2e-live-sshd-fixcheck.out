@@ -1,0 +1,16 @@
+=== E2E RESULT: PASS ===
+
+--- first sync tail ---
+sync:
+  remote: origin
+  pull: nothing to pull (no commits on master yet)
+  push: ok
+  unpushed: ? commits ahead
+  unpulled: ? commits behind
+--- second sync tail ---
+sync:
+  remote: origin
+  pull: ok
+  push: ok
+  unpushed: ? commits ahead
+  unpulled: ? commits behind

@@ -1,0 +1,18 @@
+mem: already initialized at /tmp/mem-live/s7/memories
+mem: generated Ed25519 keypair (no passphrase) at /tmp/mem-live/s7/home/key2
+mem: updated ssh-config stanza for mem-edgehost
+mem: updated origin remote to mem-edgehost:/p2
+
+=== SSH edge collector setup (one-time) ===
+1. Add to your ~/.ssh/config (exactly once):
+   Include ~/.config/mem/ssh-config
+
+2. On collector (edgehost.otherdomain.com), append to ~/.ssh/authorized_keys:
+   no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHtpmJxxk6Z5LpQkrwNa2YE3ZWkoRnAna6ZSQT3MRBUi mem@CabinInspiron22Kali
+
+3. Public key file: /tmp/mem-live/s7/home/key2.pub
+   (copy the ssh-ed25519 line above or cat it)
+4. Test connectivity: ssh mem-edgehost "git --version"
+5. Run: mem sync
+help: GitHub-hosted or D1 backends tracked in masculinecache/axi-memory#16
+S7 rc=0

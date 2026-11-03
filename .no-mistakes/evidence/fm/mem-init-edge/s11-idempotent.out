@@ -1,0 +1,6 @@
+mem: already initialized at /tmp/mem-live/s11/memories
+mem: dedicated key already exists at /tmp/mem-live/s11/home/key
+pubkey_path: /tmp/mem-live/s11/home/key.pub
+error: refusing to overwrite existing mem key
+help: rm /tmp/mem-live/s11/home/key /tmp/mem-live/s11/home/key.pub to regenerate
+rc=1

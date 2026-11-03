@@ -1,0 +1,44 @@
+=== live two-way sync over throwaway sshd (127.0.0.1:22022) ===
+--- [1] mem init --mode edge --collector phillias@127.0.0.1:/tmp/mem-live/collector/mem-bare.git (sandbox HOME, MEM_SSH_KEY_PATH) ---
+mem: initialized git repo at /tmp/mem-live/edge-memories
+mem: generated Ed25519 keypair (no passphrase) at /tmp/mem-live/edge-home/.ssh/id_ed25519_memgit
+mem: wrote managed ssh-config: /tmp/mem-live/edge-home/.config/mem/ssh-config
+mem: added origin remote mem-127:/tmp/mem-live/collector/mem-bare.git
+
+=== SSH edge collector setup (one-time) ===
+1. Add to your ~/.ssh/config (exactly once):
+   Include ~/.config/mem/ssh-config
+
+2. On collector (127.0.0.1), append to ~/.ssh/authorized_keys:
+...
+=== SSH edge collector setup (one-time) ===
+1. Add to your ~/.ssh/config (exactly once):
+   Include ~/.config/mem/ssh-config
+
+2. On collector (127.0.0.1), append to ~/.ssh/authorized_keys:
+   no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILcGITHyK6nZOMpyasG3Qo4vRgAiHqxg158PAZQ1no8A mem@CabinInspiron22Kali
+
+3. Public key file: /tmp/mem-live/edge-home/.ssh/id_ed25519_memgit.pub
+   (copy the ssh-ed25519 line above or cat it)
+4. Test connectivity: ssh mem-127 "git --version"
+5. Run: mem sync
+help: GitHub-hosted or D1 backends tracked in masculinecache/axi-memory#16
+
+--- [2] collector authorized_keys = the EXACT printed line (no forced command) ---
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILcGITHyK6nZOMpyasG3Qo4vRgAiHqxg158PAZQ1no8A mem@CabinInspiron22Kali
+
+--- [3] printed connectivity probe: ssh mem-127 "git --version" ---
+git version 2.53.0
+
+--- [4] mem add + mem sync on populated collector (pull AND push work with printed line) ---
+9efef57 mem(preference): Anchor preference
+4f997ea mem(constraint): Second memory
+c6d3ba2 mem(howto): Anchor side howto
+(first sync to this populated collector: pull: ok, push: ok, rc=0)
+
+--- [5] anchor side pushes a NEW commit to the bare collector ---
+9efef57 mem(preference): Anchor preference
+
+--- [6] mem sync (edge) pulls the anchor commit into the edge store ---
+9efef57 mem(preference): Anchor preference
+p-2026-11-03-anchor-pref.md

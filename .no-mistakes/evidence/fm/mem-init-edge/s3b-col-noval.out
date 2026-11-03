@@ -1,0 +1,3 @@
+error: --collector requires a value
+help: valid: --mode edge --collector <user@host:path>
+S3b rc=2

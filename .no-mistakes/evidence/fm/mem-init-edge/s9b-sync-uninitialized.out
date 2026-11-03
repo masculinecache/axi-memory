@@ -1,0 +1,3 @@
+sync:
+  skipped: mem store not initialized (run: mem init)
+exit=0

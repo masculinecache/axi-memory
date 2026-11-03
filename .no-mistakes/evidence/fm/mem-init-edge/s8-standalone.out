@@ -1,0 +1,5 @@
+mem: initialized git repo at /tmp/mem-live/s8/memories
+mem: standalone mode complete (no remote; sync will skip)
+help[1]:
+  Run `mem add --type constraint --title "Use pnpm"` to add your first memory
+rc=0

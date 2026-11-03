@@ -1,0 +1,8 @@
+mem: initialized git repo at /tmp/mem-scenarios/s2-mem
+mem: standalone mode complete (no remote; sync will skip)
+help[1]:
+  Run `mem add --type constraint --title "Use pnpm"` to add your first memory
+S2 first exit=0
+mem: already initialized at /tmp/mem-scenarios/s2-mem
+mem: standalone mode complete (no remote; sync will skip)
+---

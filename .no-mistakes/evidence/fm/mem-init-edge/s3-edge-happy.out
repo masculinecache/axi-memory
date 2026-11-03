@@ -1,0 +1,46 @@
+mem: initialized git repo at /tmp/mem-scenarios/s3-mem
+mem: generated Ed25519 keypair (no passphrase) at /tmp/mem-scenarios/s3-home/.ssh/id_ed25519_memgit
+mem: wrote managed ssh-config: /tmp/mem-scenarios/s3-home/.config/mem/ssh-config
+mem: added origin remote mem-edgehost:~/mem-bare.git
+
+=== SSH edge collector setup (one-time) ===
+1. Add to your ~/.ssh/config (exactly once):
+   Include ~/.config/mem/ssh-config
+
+2. On collector (edgehost.example.com), append to ~/.ssh/authorized_keys:
+   command="git-receive-pack '~/mem-bare.git'",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAmwkIcq1r95FHEGdmJk6/YGtYDqe6OXiizqn7XwobH mem@CabinInspiron22Kali
+
+3. Public key file: /tmp/mem-scenarios/s3-home/.ssh/id_ed25519_memgit.pub
+   (copy the ssh-ed25519 line above or cat it)
+4. Test connectivity: ssh mem-edgehost "git --version"
+5. Run: mem sync
+help: GitHub-hosted or D1 backends tracked in masculinecache/axi-memory#16
+help[1]:
+  Run `mem add --type constraint --title "Use pnpm"` to add your first memory
+S3 exit=0
+=== key file ===
+256 SHA256:N2l93qySLlYMYj4p7z1FofAy0o+VxaSfpsumN8BA6Vk mem@CabinInspiron22Kali (ED25519)
+=== socket-perms (no passphrase probe): 600 ===
+no passphrase: yes (empty -P works)
+=== key comment ===
+mem@CabinInspiron22Kali
+=== managed ssh config ===
+# mem init --mode edge managed file — do not edit by hand
+
+Host mem-edgehost
+  HostName edgehost.example.com
+  User testuser
+  IdentityFile /tmp/mem-scenarios/s3-home/.ssh/id_ed25519_memgit
+  IdentitiesOnly yes
+=== real ~/.ssh/config untouched? ===
+total 8
+drwx------ 2 phillias phillias  80 Nov  2 20:56 .
+drwxrwxr-x 4 phillias phillias  80 Nov  2 20:56 ..
+-rw------- 1 phillias phillias 419 Nov  2 20:56 id_ed25519_memgit
+-rw-r--r-- 1 phillias phillias 105 Nov  2 20:56 id_ed25519_memgit.pub
+~/.ssh/config does not exist (good)
+=== git remote ===
+origin	mem-edgehost:~/mem-bare.git (fetch)
+origin	mem-edgehost:~/mem-bare.git (push)
+=== key type ===
+ssh-ed25519

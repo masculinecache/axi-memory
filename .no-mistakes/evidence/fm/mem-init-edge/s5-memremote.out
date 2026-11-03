@@ -1,0 +1,20 @@
+mem: initialized git repo at /tmp/mem-live/s5/memories
+mem: generated Ed25519 keypair (no passphrase) at /tmp/mem-live/s5/home/key
+mem: wrote managed ssh-config: /tmp/mem-live/s5/home/.config/mem/ssh-config
+mem: added myremote remote mem-ehost:/repo.git
+
+=== SSH edge collector setup (one-time) ===
+1. Add to your ~/.ssh/config (exactly once):
+   Include ~/.config/mem/ssh-config
+
+2. On collector (ehost), append to ~/.ssh/authorized_keys:
+   no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILn3j0sZYUchLjfrtQJw7UY/2UVnEP1pF9JlyyykxoLM mem@CabinInspiron22Kali
+
+3. Public key file: /tmp/mem-live/s5/home/key.pub
+   (copy the ssh-ed25519 line above or cat it)
+4. Test connectivity: ssh mem-ehost "git --version"
+5. Run: mem sync
+help: GitHub-hosted or D1 backends tracked in masculinecache/axi-memory#16
+help[1]:
+  Run `mem add --type constraint --title "Use pnpm"` to add your first memory
+S5 rc=0

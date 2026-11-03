@@ -1,0 +1,26 @@
+=== FRESH machine #2 + FRESH EMPTY collector (collector2) — first-sync deadlock regression ===
+empty collector refs BEFORE first sync:
+
+--- mem add ---
+  id: d-2026-11-03-fresh-empty-collector-decision
+--- FIRST mem sync ---
+sync:
+  remote: origin
+  pull: nothing to pull (no commits on master yet)
+  push: ok
+  unpushed: ? commits ahead
+  unpulled: ? commits behind
+first sync rc=0
+
+collector refs AFTER first sync:
+refs/heads/master 31f7716
+31f7716 mem(decision): Fresh empty collector decision
+
+--- SECOND mem sync (populated collector -> pull path) ---
+sync:
+  remote: origin
+  pull: ok
+  push: ok
+  unpushed: ? commits ahead
+  unpulled: ? commits behind
+second sync rc=0

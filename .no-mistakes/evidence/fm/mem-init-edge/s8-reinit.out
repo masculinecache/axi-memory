@@ -1,0 +1,28 @@
+mem: already initialized at /tmp/mem-scenarios/s8-mem
+mem: generated Ed25519 keypair (no passphrase) at /tmp/mem-scenarios/s8-home/.ssh/id_ed25519_memgit
+mem: updated ssh-config stanza for mem-edgehost
+mem: updated origin remote to mem-edgehost:/p2
+
+=== SSH edge collector setup (one-time) ===
+1. Add to your ~/.ssh/config (exactly once):
+   Include ~/.config/mem/ssh-config
+
+2. On collector (edgehost.otherdomain.com), append to ~/.ssh/authorized_keys:
+   command="git-receive-pack '/p2'",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH77/Ukur2Tlgby6fRD/OPRKdTL9UkkS0Jwrz2Cydx/s mem@CabinInspiron22Kali
+
+3. Public key file: /tmp/mem-scenarios/s8-home/.ssh/id_ed25519_memgit.pub
+   (copy the ssh-ed25519 line above or cat it)
+4. Test connectivity: ssh mem-edgehost "git --version"
+5. Run: mem sync
+help: GitHub-hosted or D1 backends tracked in masculinecache/axi-memory#16
+S8 exit=0
+--- managed ssh-config after re-init ---
+# mem init --mode edge managed file — do not edit by hand
+
+Host mem-edgehost
+  HostName edgehost.otherdomain.com
+  User user2
+  IdentityFile /tmp/mem-scenarios/s8-home/.ssh/id_ed25519_memgit
+  IdentitiesOnly yes
+--- remote after re-init ---
+mem-edgehost:/p2

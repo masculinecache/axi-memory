@@ -1,0 +1,24 @@
+=== FIX1: first sync on fresh empty collector (local bare remote, no sshd) ===
+--- FIRST sync ---
+sync:
+  remote: origin
+  pull: nothing to pull (no commits on master yet)
+  push: ok
+  unpushed: ? commits ahead
+  unpulled: ? commits behind
+exit=0
+--- collector refs ---
+refs/heads/master 217a436
+--- SECOND sync ---
+sync:
+  remote: origin
+  pull: ok
+  push: ok
+  unpushed: ? commits ahead
+  unpulled: ? commits behind
+exit=0
+
+=== FIX3: invalid --collector structured error ===
+exit=2
+mem: initialized git repo at /tmp/reproB-final.sBeeSF/mem
+error: invalid --collector 'garbage-no-at' (expected user@host:/path/to/bare.git)

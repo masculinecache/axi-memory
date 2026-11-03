@@ -1,0 +1,7 @@
+mem: initialized git repo at /tmp/mem-scenarios/s4-mem
+mem: dedicated key already exists at /tmp/mem-scenarios/s4-home/.ssh/id_ed25519_memgit
+pubkey_path: /tmp/mem-scenarios/s4-home/.ssh/id_ed25519_memgit.pub
+error: refusing to overwrite existing mem key
+help: rm /tmp/mem-scenarios/s4-home/.ssh/id_ed25519_memgit /tmp/mem-scenarios/s4-home/.ssh/id_ed25519_memgit.pub to regenerate
+S4 exit=1
+key untouched: yes

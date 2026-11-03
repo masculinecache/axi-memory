@@ -1,0 +1,8 @@
+mem: init requires --mode (non-interactive)
+mode[2]{mode,description}:
+  standalone,initialize local memory dir as plain git repo (no remote)
+  edge,initialize + SSH collector wiring with dedicated key (--collector required)
+help[2]:
+  mem init --mode standalone
+  mem init --mode edge --collector user@host:/path/to/mem-bare.git
+rc=2

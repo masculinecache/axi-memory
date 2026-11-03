@@ -1,0 +1,3 @@
+error: --mode edge requires --collector <user@host:bare-repo-path>
+help: example: --collector phillias@edgehost:~/mem-bare.git
+S5 exit=2
