@@ -1,0 +1,35 @@
+name: Bug report
+description: Report a defect in this repo
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is broken? Include the expected vs actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Steps to reproduce. Include commands, inputs, or URLs.
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: One bullet per condition that must be true for this to be fixed.
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: reversion
+    attributes:
+      label: Reversion actions
+      description: Temporary state changes this fix requires (crontab, firewall, service stop, feature flag). Leave empty if none. Verify all are reverted before closing this issue.
+      render: markdown
+    validations:
+      required: false

@@ -1,0 +1,38 @@
+name: Feature or task
+description: Request a new feature, change, or task in this repo
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What should happen and why. One paragraph.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: One bullet per condition that must be true for this to be done.
+      render: markdown
+    validations:
+      required: true
+  - type: dropdown
+    id: delivery
+    attributes:
+      label: Delivery mode
+      options:
+        - no-mistakes (full pipeline review)
+        - direct-PR (push + PR, no pipeline)
+        - local-only (ready branch, manual merge)
+        - undecided
+    validations:
+      required: false
+  - type: textarea
+    id: reversion
+    attributes:
+      label: Reversion actions
+      description: Temporary state changes this work requires (crontab, firewall, service stop, feature flag). Leave empty if none. Verify all are reverted before closing this issue.
+      render: markdown
+    validations:
+      required: false
